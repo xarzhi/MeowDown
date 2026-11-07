@@ -7,7 +7,9 @@ param(
     [int]$Click2Y = -1,
     [string]$TypeText = "",
     [string]$Steps = "",
-    [int]$WaitMs = 1800
+    [int]$WaitMs = 1800,
+    # Which binary to photograph. Empty means the debug build.
+    [string]$Exe = ""
 )
 
 Add-Type -AssemblyName System.Drawing
@@ -55,7 +57,7 @@ function Set-Foreground([IntPtr]$target) {
     }
 }
 
-$exe = Join-Path (Split-Path -Parent $PSScriptRoot) "target\debug\meowdown.exe"
+$exe = if ($Exe -ne "") { $Exe } else { Join-Path (Split-Path -Parent $PSScriptRoot) "target\debug\meowdown.exe" }
 # An instance left over from an interrupted run keeps drawing the same file, so
 # the click would land on both windows and the shot could be either one.
 Get-Process meowdown -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
