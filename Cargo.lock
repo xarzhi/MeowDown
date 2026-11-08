@@ -3714,13 +3714,14 @@ dependencies = [
 
 [[package]]
 name = "meowdown"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui-kit",
  "image",
  "rfd",
  "serde",
  "serde_json",
+ "two-face",
  "ureq",
  "winreg 0.52.0",
 ]

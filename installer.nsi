@@ -1,7 +1,7 @@
 ﻿; MeowDown 的 NSIS 安装包脚本
 ;
 ; 平时不用直接调它，交给 package.ps1：
-;   powershell -ExecutionPolicy Bypass -File .\package.ps1 -Version 0.2.0 -Setup
+;   powershell -ExecutionPolicy Bypass -File .\package.ps1 -Version 0.2.0
 ;
 ; 也可以手动编译（版本号自己换）：
 ;   makensis /DVERSION=0.2.0 /DVERSION_QUAD=0.2.0.0 ^
@@ -54,8 +54,11 @@ BrandingText "${APP_NAME} ${VERSION}"
 OutFile "${OUTFILE}"
 
 InstallDir "$LOCALAPPDATA\Programs\${APP_NAME}"
-; 升级安装时沿用上次选的目录。
-InstallDirRegKey HKCU "${APP_KEY}" "InstallDir"
+; 升级时沿用上次选的目录由 .onInit 里的 FindInstalled 负责。
+;
+; 这里故意不用 InstallDirRegKey：它是安装器初始化时读的，早于 .onInit 里的
+; SetRegView 64，而 32 位的安装程序默认被重定向到 WOW6432Node，读的键根本
+; 不存在——结果就是每次升级都回到默认目录。
 
 ; 只写 HKCU，所以不要管理员权限；这样双击就能装完。
 RequestExecutionLevel user
@@ -121,6 +124,62 @@ LangString DESC_SEC_DESKTOP   ${LANG_ENGLISH}     "Put a MeowDown shortcut on th
 LangString DESC_SEC_ASSOC     ${LANG_SIMPCHINESE} "把 .md / .markdown / .mdown 关联到 MeowDown（只改当前用户）。Windows 10/11 上系统仍会让你确认一次：设置 → 默认应用 → 按文件类型指定默认应用。"
 LangString DESC_SEC_ASSOC     ${LANG_ENGLISH}     "Associate .md / .markdown / .mdown with MeowDown for the current user. Windows 10/11 still asks once in Settings > Default apps."
 
+; ---------------------------------------------------------------- 装过没有
+
+; 找出这台电脑上已经装过的 MeowDown：$0 = 安装目录（空 = 没装过），
+; $1 = 上次安装的版本号。
+;
+; 四个位置都看一遍：当前用户 / 机器级，各两个注册表视图 —— 老版本可能被
+; 32 位安装程序写进了 WOW6432Node，也可能当年是用管理员装到 Program Files。
+Function FindInstalled
+  StrCpy $0 ""
+  StrCpy $1 ""
+
+  SetRegView 64
+  ReadRegStr $0 HKCU "${APP_KEY}" "InstallDir"
+  ${If} $0 == ""
+    ReadRegStr $0 HKCU "${UNINST_KEY}" "InstallLocation"
+  ${EndIf}
+  ReadRegStr $1 HKCU "${UNINST_KEY}" "DisplayVersion"
+  ${If} $1 == ""
+    ReadRegStr $1 HKCU "${APP_KEY}" "Version"
+  ${EndIf}
+
+  ${If} $0 == ""
+    SetRegView 32
+    ReadRegStr $0 HKCU "${APP_KEY}" "InstallDir"
+    ${If} $0 == ""
+      ReadRegStr $0 HKCU "${UNINST_KEY}" "InstallLocation"
+    ${EndIf}
+    ${If} $1 == ""
+      ReadRegStr $1 HKCU "${UNINST_KEY}" "DisplayVersion"
+    ${EndIf}
+  ${EndIf}
+
+  ${If} $0 == ""
+    SetRegView 64
+    ReadRegStr $0 HKLM "${UNINST_KEY}" "InstallLocation"
+    ${If} $1 == ""
+      ReadRegStr $1 HKLM "${UNINST_KEY}" "DisplayVersion"
+    ${EndIf}
+  ${EndIf}
+
+  ${If} $0 == ""
+    SetRegView 32
+    ReadRegStr $0 HKLM "${UNINST_KEY}" "InstallLocation"
+  ${EndIf}
+
+  SetRegView 64
+
+  ; 注册表里留着键、目录却早被删掉的情况很常见（手动删除、清理软件），
+  ; 程序不在就不算装过，否则会"沿用"一个不存在的目录。
+  ${If} $0 != ""
+    ${IfNot} ${FileExists} "$0\${APP_EXE}"
+      StrCpy $0 ""
+    ${EndIf}
+  ${EndIf}
+FunctionEnd
+
 ; ---------------------------------------------------------------- 安装
 
 Function .onInit
@@ -132,6 +191,34 @@ Function .onInit
   SetRegView 64
   ; 快捷方式只放进当前用户，和下面的 HKCU 写入保持一致。
   SetShellVarContext current
+
+  Call FindInstalled
+  ${If} $0 != ""
+    ; 目录还得能写：机器级安装可能落在 Program Files，当前用户改不动。
+    ClearErrors
+    FileOpen $9 "$0\.meowdown-write-test" w
+    ${If} ${Errors}
+      IfSilent no_write_warning
+      MessageBox MB_OK|MB_ICONEXCLAMATION "检测到 ${APP_NAME} 已安装在：$\r$\n$0$\r$\n$\r$\n当前用户没有权限写这个目录（可能是当年用管理员装的），本次改为安装到：$\r$\n$INSTDIR"
+      no_write_warning:
+      StrCpy $0 ""
+    ${Else}
+      FileClose $9
+      Delete "$0\.meowdown-write-test"
+      ; 覆盖装回原处：目录旁边的图片、字体、设置都还按老路径找得到。
+      StrCpy $INSTDIR $0
+      ; 静默安装（/S）没人看提示，直接用原目录装完。
+      IfSilent upgraded
+      ${If} $1 != ""
+        StrCpy $2 "${APP_NAME} $1"
+      ${Else}
+        StrCpy $2 "${APP_NAME}"
+      ${EndIf}
+      ; 只是说一声，不拦路：下一步的目录页里仍然可以改路径。
+      MessageBox MB_OK|MB_ICONINFORMATION "检测到这台电脑已经安装了 $2。$\r$\n$\r$\n安装路径已沿用原来的目录：$\r$\n$0$\r$\n$\r$\n点「确定」继续覆盖安装（文档和设置不受影响），在下一步的目录页里可以改路径。" IDOK upgraded
+      upgraded:
+    ${EndIf}
+  ${EndIf}
 FunctionEnd
 
 Section "$(SEC_MAIN)" SecMain

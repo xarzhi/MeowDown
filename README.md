@@ -10,7 +10,7 @@
 - **行内元素**：加粗、斜体、删除线、行内代码（JetBrains Mono，字体已内嵌）、行内公式、超链接
 - **超链接**：`Ctrl+点击` 打开；网络地址交给浏览器，相对路径在本窗口打开并滑到 `#标题` 的位置，鼠标悬停显示手型
 - **侧边栏**：文件树 + 大纲，`Ctrl+Shift+O` 打开整个文件夹
-- **图片**：粘贴即入稿，可配置 PicGo 上传图床
+- **图片**：粘贴即入稿，可配置 PicGo 上传图床；单击就地露出 Markdown 源码，**双击**看全屏大图——滚轮缩放、拖动平移、`←` `→` 翻本篇的上下张，`0` 复位、`Esc` 回来，关闭后顺势停在它的 Markdown 源码上
 - **自动保存**、深浅色主题、专注模式、源码模式（`Ctrl+/`）
 - **文件关联**：一键把 MeowDown 设为 `.md` 的默认应用
 
@@ -30,33 +30,29 @@ cargo build --release
 
 ## 打包
 
-版本号自己定，脚本会写回 `Cargo.toml` 并产出带版本号的目录和压缩包：
+一条命令，产物只有一个 NSIS 安装包。版本号自己定，脚本会写回 `Cargo.toml`：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\package.ps1 -Version 0.2.0
 ```
 
-产物：
-
-```
-dist\MeowDown-v0.2.0-win64\
-dist\MeowDown-v0.2.0-win64.zip
-```
-
-要安装包（NSIS 的 setup.exe）就加 `-Setup`：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\package.ps1 -Version 0.2.0 -Setup
-```
-
-产物多一个 `dist\MeowDown-v0.2.0-setup.exe`（约 8 MB）。它装到当前用户的
+产物：`dist\MeowDown-v0.2.0-setup.exe`（约 8 MB）。它装到当前用户的
 `%LOCALAPPDATA%\Programs\MeowDown`，不写 `HKLM`、不弹 UAC；向导里可以选桌面
 快捷方式、开始菜单和 `.md` 关联，卸载入口在「设置 → 应用 → 已安装的应用」。
 
-`-Setup` 需要 `makensis`：`winget install NSIS.NSIS` 即可，装在别处就用
-`-Makensis <路径>` 指定。安装脚本是 `installer.nsi`，也可以自己手动编译。
+重装或升级时会先查一遍这台电脑是不是已经装过（当前用户 / 机器级的两个注册表
+视图都看，并且确认目录里程序还在），装上过就把安装路径自动换成原来的目录，
+不会又装出一份新的；想换地方在向导的目录页里改，或者先卸载旧的。
 
-只想用当前版本号打包：去掉 `-Version`。加上 `-Register` 会顺手把这份 exe 注册为 `.md` 的打开方式。
+脚本不再产出便携目录和 zip：要绿色版直接 `cargo build --release`，文件在
+`target\release\meowdown.exe`。
+
+需要 `makensis`：`winget install NSIS.NSIS` 即可，装在别处就用 `-Makensis <路径>`
+指定，项目里的 `tools\nsis\` 也会被自动找到。安装脚本是 `installer.nsi`，也可以
+自己手动编译。
+
+只想用当前版本号打包：去掉 `-Version`；二进制已经在手、跳过编译：加 `-SkipBuild`；
+加上 `-Register` 会顺手把这份 exe 注册为 `.md` 的打开方式。
 
 ## 设为 .md 默认应用
 

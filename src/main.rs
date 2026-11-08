@@ -13,6 +13,7 @@ mod math;
 mod model;
 mod remote;
 mod settings;
+mod shellops;
 
 use gpui_kit::base::input::CursorBlink;
 use gpui_kit::*;

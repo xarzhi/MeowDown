@@ -1,19 +1,37 @@
 ﻿[package]
 name = "meowdown"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A Typora-like WYSIWYG Markdown editor built with GPUI Kit"
 
 [dependencies]
 gpui-kit = { version = "0.9.0", features = ["syntect"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "2"
+# The very syntax set the code editor highlights with, so the language list can
+# offer exactly the names a fence is able to colour. Already in the tree behind
+# gpui-kit's `syntect` feature, and asked for with the same features it was
+# built with, so nothing new is compiled.
+two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
 
 [profile.dev]
 opt-level = 1
+
+# The release binary is ~34 MB by default: sixteen codegen units, no cross-crate
+# inlining, unwinding panics and a symbol table, most of which the program never
+# uses at run time. One unit plus fat LTO lets the linker drop the copies of
+# generic instantiations that each crate instantiates for itself, which is where
+# most of the weight lives (gpui, gpui-base and gpui-component are all heavily
+# generic).
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
 
 [profile.dev.package."*"]
 opt-level = 2

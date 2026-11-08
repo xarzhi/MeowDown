@@ -9,15 +9,15 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, Theme, ThemeColor, ThemeMode,
     button::{Button, ButtonVariants as _},
     input::{
-        Editor, EditorState, Input as TextInput, InputEvent, InputState, MoveDown, MoveUp, Paste,
-        Textarea, TextareaState,
+        Editor, EditorState, Input as TextInput, InputEvent, InputState, MoveDown, MoveLeft, MoveRight,
+        MoveUp, Paste, Textarea, TextareaState,
     },
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::{Scrollbar, ScrollbarMode},
@@ -35,6 +35,7 @@ use crate::inline;
 use crate::math;
 use crate::model::{self, BlockKind, PlainBlock};
 use crate::settings::{self, ImageHost, ImageMode, Settings};
+use crate::shellops;
 
 /// Which page the settings dialog shows.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +134,7 @@ const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         &[
             Shortcut { keys: "Ctrl+/", action: "源码模式" },
             Shortcut { keys: "Ctrl+Shift+L", action: "显示/隐藏侧边栏" },
+            Shortcut { keys: "双击图片", action: "全屏看图（滚轮缩放、拖动平移、← → 翻页）" },
             Shortcut { keys: "F8", action: "专注模式" },
             Shortcut { keys: "F11", action: "全屏" },
             Shortcut { keys: "Ctrl+L", action: "选中当前行" },
@@ -208,6 +210,30 @@ const MATH_SIZE: f32 = 17.5;
 /// How far the editor keeps its text off the left edge of its box. The prose it
 /// replaces starts flush, so the box is shifted by this much to line them up.
 const TEXT_INSET: Pixels = px(6.0);
+
+/// What a brand-new file says while it has no words in it. A page that is
+/// nothing but white is indistinguishable from a page that failed to load, and
+/// the caret alone is a thin line easy to miss on a large screen.
+const EMPTY_PAGE_HINT: &str = "从这里开始写…";
+
+/// How much of the content area the reading column takes. The remainder is the
+/// air on either side, so the text never runs edge to edge — and because this
+/// is a share rather than a fixed width, the column keeps growing with the
+/// window instead of stopping at some measure.
+const PAGE_WIDTH_RATIO: f32 = 0.95;
+/// Below this the column stops shrinking and the margins give way instead — on
+/// a small window the text matters more than the air around it.
+const PAGE_MIN_WIDTH: f32 = 360.0;
+
+/// The air the picture viewer keeps around a picture that has just been fitted
+/// to the window, so the arrows have somewhere to live.
+const VIEWER_PAD: f32 = 64.0;
+/// How far the wheel can take a picture. Below a tenth everything is a speck;
+/// past eight times, one pixel of the picture is a block of screen.
+const VIEWER_MIN_ZOOM: f32 = 0.1;
+const VIEWER_MAX_ZOOM: f32 = 8.0;
+/// A press that travels more than this is a drag, not a click.
+const VIEWER_CLICK_SLOP: f32 = 4.0;
 
 
 
@@ -293,6 +319,14 @@ impl From<Entity<TextareaState>> for FocusTarget {
 
 pub struct MeowDown {
     path: Option<PathBuf>,
+    /// Whether the page is the bundled sample document.
+    ///
+    /// The sample has no path of its own, so "no file, no folder" used to mean
+    /// "this is the sample". Now that it is only ever shown on the first
+    /// launch, a page with no path is just an unnamed document, and the two
+    /// need telling apart: the line above the page says something different
+    /// for each.
+    sample: bool,
     blocks: Vec<Block>,
     active_id: Option<u64>,
     /// A selection being dragged out inside one paragraph, if there is one.
@@ -315,6 +349,13 @@ pub struct MeowDown {
     settings_tab: SettingsTab,
     fields: SettingsFields,
     sidebar_visible: bool,
+    /// How much of the panel is on screen, 0 when it is folded away and 1 when
+    /// it is fully out. Kept apart from `sidebar_visible` — that one is where
+    /// the user asked it to go, this one is where it is on the way there, so a
+    /// second toggle can pick the panel up mid-flight instead of jumping.
+    sidebar_pos: f32,
+    /// The fold in flight, while the panel is sliding shut or open.
+    sidebar_anim: Option<Slide>,
     /// Which list the left panel is showing.
     sidebar_tab: SidebarTab,
     /// Markdown files found next to the open document.
@@ -344,6 +385,12 @@ pub struct MeowDown {
     bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
     /// The code block whose language field currently holds focus.
     lang_focus: Option<u64>,
+    /// The language list open under that field, while it is up.
+    lang_menu: Option<LangMenu>,
+    /// Window-space bounds of each fence's language field, captured while
+    /// painting. The list hangs off the field, so it has to know where the field
+    /// ended up — the block's own rectangle is not it.
+    lang_bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
     /// Images already downloaded from the web, keyed by URL.
     remote_images: HashMap<String, Arc<Image>>,
     /// URLs whose download is in flight, so a repaint does not start a second.
@@ -385,6 +432,31 @@ pub struct MeowDown {
     /// laid out. The bounds a glide needs only exist once the new blocks have
     /// been painted, so the jump is finished on a later frame.
     pending_anchor: Option<String>,
+    /// The right-click menu of the file tree, while it is open.
+    menu: Option<FileMenu>,
+    /// The modal a file-tree command opened, while it is up.
+    prompt: Option<Prompt>,
+    /// Whether the "save before closing?" question is on screen.
+    close_prompt: bool,
+    /// Whether the window's close hook has been installed. It is registered on
+    /// the first frame, where the view finally has a handle to give it.
+    close_hooked: bool,
+    /// Where the keyboard goes while the close question is on screen. The page
+    /// keeps its caret, but it does not keep the keys: a focused card can take
+    /// Enter before the field turns it into a line break.
+    close_focus: FocusHandle,
+    /// The full-window picture viewer, while a picture is being looked at.
+    viewer: Option<Viewer>,
+    /// Intrinsic size of a picture, keyed by the source it was written as.
+    image_sizes: HashMap<String, Size<f32>>,
+    /// The block whose picture was pressed last, and when.
+    ///
+    /// A double click on a picture is awkward: the first press opens the block
+    /// for editing, which lays the Markdown source out above the picture and
+    /// pushes it down. The second press then lands on that source row instead
+    /// of the picture, so the press is remembered here and the block can still
+    /// tell that the gesture was aimed at its picture.
+    picture_press: Option<(u64, Instant)>,
 }
 
 /// One cell of a table, open for editing.
@@ -395,6 +467,108 @@ struct TableCellEdit {
     column: usize,
     state: Entity<InputState>,
     _subscription: Subscription,
+}
+
+/// What a right-click in the file tree was aimed at, and where the menu opened.
+#[derive(Clone)]
+struct FileMenu {
+    path: PathBuf,
+    /// Whether the row was a folder. A file row answers with the commands that
+    /// act on a document, a folder row with the ones that act on a place.
+    is_dir: bool,
+    /// The click, in window coordinates — the menu opens at the pointer.
+    at: Point<Pixels>,
+}
+
+/// One language a fenced block can be written in.
+#[derive(Clone)]
+struct LangChoice {
+    /// What goes into the fence — a token syntect resolves to a syntax.
+    token: String,
+    /// What the list shows: the syntax's own name, which is what a reader
+    /// recognises ("Rust", not "rs").
+    name: String,
+}
+
+/// The drop-down under a fence's language field: every language syntect knows,
+/// filtered by what has been typed into that field.
+struct LangMenu {
+    block: u64,
+    /// The rows on offer right now. Recomputed on every keystroke, so the list
+    /// is the answer to what the field says and nothing else.
+    rows: Vec<LangChoice>,
+    /// The row the keyboard is on.
+    active: usize,
+    /// How far the list has been scrolled, in pixels.
+    scroll: f32,
+}
+
+/// A picture being looked at full-window.
+///
+/// It is a viewer rather than a preview because it is a small one: the wheel
+/// zooms, the pointer drags the picture around, and the arrows walk the other
+/// pictures of the same document, in reading order, without going back to the
+/// page in between.
+struct Viewer {
+    /// Every picture the document holds, in the order the page shows them.
+    items: Vec<ViewerItem>,
+    /// Which of them is on show.
+    at: usize,
+    /// 1.0 is the picture fitted to the window; the wheel multiplies it.
+    zoom: f32,
+    /// How far the picture has been dragged from the middle.
+    offset: Point<Pixels>,
+    /// The press that is currently moving the picture, if one is.
+    drag: Option<ViewerDrag>,
+}
+
+/// One picture the viewer can show.
+struct ViewerItem {
+    /// The block it came from, so closing the viewer can hand the page back.
+    block: u64,
+    /// The source exactly as the Markdown wrote it — a path or a URL.
+    src: String,
+    /// The alt text, which makes a decent caption when there is one.
+    alt: String,
+}
+
+/// A press that has not been released yet.
+struct ViewerDrag {
+    /// Where the press went down.
+    from: Point<Pixels>,
+    /// The offset the picture had at that moment.
+    origin: Point<Pixels>,
+    /// How far the pointer has travelled since, so a press that did not move
+    /// can be told from a drag.
+    moved: f32,
+}
+
+/// A small modal the file tree asks for: a name to type, a delete to confirm, a
+/// search box, or the properties card.
+struct Prompt {
+    kind: PromptKind,
+    /// The file or folder the prompt acts on. For `NewFile` / `NewFolder` this
+    /// is the folder the new thing is being named in.
+    path: PathBuf,
+    title: SharedString,
+    /// The one text field a prompt has, when it has one at all.
+    field: Option<Entity<TextareaState>>,
+    /// A line under the field: what went wrong last time, or how many results
+    /// a search found.
+    note: SharedString,
+    /// Search results, and the query they were found for.
+    hits: Vec<PathBuf>,
+    hits_query: String,
+    /// The rows of the properties card.
+    rows: Vec<(String, String)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    Rename,
+    Delete,
+    Properties,
+    Search,
 }
 
 /// One entry of the undo history: every block's text and type, plus where the
@@ -413,6 +587,8 @@ const UNDO_DEPTH: usize = 200;
 const SCROLL_GLIDE: Duration = Duration::from_millis(260);
 /// How long the side panel's thumb takes to travel between its two slots.
 const TAB_GLIDE: Duration = Duration::from_millis(210);
+/// How long the side panel itself takes to fold away, or to unfold.
+const SIDEBAR_SLIDE: Duration = Duration::from_millis(190);
 
 /// A scroll in flight, from one offset to another.
 #[derive(Clone, Copy)]
@@ -443,7 +619,8 @@ fn tab_slot(tab: SidebarTab) -> f32 {
     }
 }
 
-/// A thumb sliding between two slots of the side panel switch.
+/// A value gliding between two points — the side panel's thumb travelling to
+/// its other slot, the panel itself folding away.
 #[derive(Clone, Copy)]
 struct Slide {
     from: f32,
@@ -471,8 +648,9 @@ struct CodeRows {
 }
 
 impl MeowDown {
-    /// Open the editor on `path` when one was passed on the command line,
-    /// otherwise on the bundled sample document.
+    /// Open the editor on `path` when one was passed on the command line; on
+    /// the bundled sample the very first time the program runs; otherwise on
+    /// an empty page.
     pub fn with_path(
         path: Option<PathBuf>,
         window: &mut Window,
@@ -506,6 +684,7 @@ impl MeowDown {
         let settings = Settings::load();
         let mut this = Self {
             path: None,
+            sample: false,
             blocks: Vec::new(),
             active_id: None,
             drag: None,
@@ -520,6 +699,8 @@ impl MeowDown {
             settings_tab: SettingsTab::General,
             fields,
             sidebar_visible: true,
+            sidebar_pos: 1.,
+            sidebar_anim: None,
             sidebar_tab: SidebarTab::Outline,
             folder_files: Vec::new(),
             folder_dir: None,
@@ -533,6 +714,8 @@ impl MeowDown {
             association: SharedString::default(),
             bounds: Rc::new(RefCell::new(HashMap::new())),
             lang_focus: None,
+            lang_menu: None,
+            lang_bounds: Rc::new(RefCell::new(HashMap::new())),
             remote_images: HashMap::new(),
             remote_pending: std::collections::HashSet::new(),
             remote_failed: std::collections::HashSet::new(),
@@ -550,31 +733,53 @@ impl MeowDown {
             expanded: std::collections::HashSet::new(),
             table_edit: None,
             pending_anchor: None,
+            menu: None,
+            prompt: None,
+            close_prompt: false,
+            close_hooked: false,
+            close_focus: cx.focus_handle(),
+            viewer: None,
+            image_sizes: HashMap::new(),
+            picture_press: None,
         };
 
         // A folder on the command line opens that folder: the side panel lists
-        // every Markdown file inside it and the first one opens.
+        // every Markdown file inside it. No note is opened along with it.
         let folder = path.as_ref().filter(|path| path.is_dir()).cloned();
         let path = path.filter(|path| path.is_file());
         if let Some(dir) = folder {
-            this.root = Some(dir.clone());
-            this.last_dir = Some(dir.clone());
-            this.folder_files = markdown_files_deep(&dir);
-            this.folder_dir = Some(dir.clone());
-            this.folder_deep = true;
-            this.folder_scan_at = Some(Instant::now());
-            this.tree = Some(folder_tree(&dir));
-            this.snap_sidebar_tab(SidebarTab::Files);
+            this.adopt_root(dir);
         }
-        let path = path.or_else(|| this.folder_files.first().cloned());
+        // A note opened on its own brings its folder with it, the way a folder
+        // does: the notes beside it are the thing a reader is most likely to
+        // reach for next, and a trip through 打开文件夹 to get at them would be
+        // a step the command line already knew the answer to.
+        if let Some(current) = path.as_ref() {
+            this.adopt_parent(current);
+        }
+        // Opening a folder opens the folder, not one of the notes inside it:
+        // which note to read is the user's call, so the page starts blank and
+        // waits for a click in the list.
+        let folder_open = this.root.is_some();
         if let Some(current) = path.clone() {
             this.reveal_in_tree(&current);
         }
 
-        let initial = path
-            .as_ref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .unwrap_or_else(|| SAMPLE.to_string());
+        // The bundled sample is a greeting, not a landing page: it is handed
+        // out on the very first launch and never again, so a reader who opens
+        // the program to write something lands on an empty page instead of a
+        // file they never asked for. A launch that already has a document, or
+        // a folder, spends nothing — the greeting is still there for the first
+        // bare launch.
+        let show_sample = path.is_none() && !folder_open && settings::claim_welcome();
+
+        let initial = if show_sample {
+            SAMPLE.to_string()
+        } else {
+            path.as_ref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .unwrap_or_default()
+        };
         let mut blocks = Vec::new();
         for plain in model::parse(&initial) {
             blocks.push(this.make_block(window, cx, plain));
@@ -584,6 +789,7 @@ impl MeowDown {
         }
         this.blocks = blocks;
         this.path = path;
+        this.sample = show_sample;
         this.focus_first(window, cx);
         if let Some(title) = this.window_title() {
             window.set_window_title(&title);
@@ -977,6 +1183,20 @@ impl MeowDown {
         let chips = code_chips(&inline.spans);
         let (hit, _) = caret_at_point(&display, size, bold, &chips, width, x, y, window);
         let caret = display_to_source(&inline, &gaps, hit);
+        self.place_caret(index, caret, window, cx);
+    }
+
+    /// Put the caret at `caret` — a byte offset into the block's Markdown — and
+    /// give the field the shape that caret asks for: the run it lands in opens
+    /// its markers. Used both by a click, which has a pointer to translate, and
+    /// by a click on the page around the text, which has no pointer inside a
+    /// line and simply wants the caret at one end of the nearest block.
+    fn place_caret(&mut self, index: usize, caret: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(block) = self.blocks.get(index) else {
+            return;
+        };
+        let id = block.id;
+        let source = block.text.to_string();
         // `set_selected_range` speaks UTF-8 byte offsets, like the parser does.
         let caret = boundary(&source, caret.min(source.len()));
         // A click on the very edge of an open run belongs *inside* it: the
@@ -1008,6 +1228,123 @@ impl MeowDown {
             anchor: placed,
             head: placed,
         });
+        cx.notify();
+    }
+
+    /// Whether a press fell inside the box of a block that is on the page.
+    ///
+    /// Every block records where it ended up: prose through the probe in
+    /// `render_block`, and the blocks that bring their own interior — a fence,
+    /// a picture, a formula, a table — through `block_probe`. Only ids the
+    /// document still has count, so a rectangle left behind by a block that has
+    /// since been deleted cannot swallow a click.
+    fn press_inside_block(&self, at: Point<Pixels>) -> bool {
+        let bounds = self.bounds.borrow();
+        self.blocks.iter().any(|block| {
+            bounds.get(&block.id).is_some_and(|area| {
+                at.x >= area.left()
+                    && at.x <= area.right()
+                    && at.y >= area.top()
+                    && at.y <= area.bottom()
+            })
+        })
+    }
+
+    /// An invisible layer that records where a block sits.
+    ///
+    /// A block's own box is not painted by anything that reports its bounds, so
+    /// the same trick the prose uses — an absolutely positioned canvas that
+    /// takes no room in the layout — is hung inside the block to note down the
+    /// rectangle a press can be measured against.
+    fn block_probe(&self, id: u64) -> AnyElement {
+        let map = self.bounds.clone();
+        canvas(
+            move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                map.borrow_mut().insert(id, bounds);
+            },
+            |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .into_any_element()
+    }
+
+    /// Record where a fence's language field landed, so the language list can
+    /// hang off it. The block's own rectangle will not do: the field is a small
+    /// box in its bottom-right corner, and the list has to open from there.
+    fn lang_probe(&self, id: u64) -> AnyElement {
+        let map = self.lang_bounds.clone();
+        canvas(
+            move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                map.borrow_mut().insert(id, bounds);
+            },
+            |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .into_any_element()
+    }
+
+    /// A click on the page but not on a line of text — the padding around the
+    /// column, the space below the last paragraph. Focusing that empty space is
+    /// what every editor does: the caret goes to the nearest block, at the end
+    /// when the pointer is past it and at the start when it is above.
+    fn focus_page_at(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.source_mode || self.blocks.is_empty() {
+            return;
+        }
+        // A press that landed on a block belongs to that block. Images and
+        // formulas turn their source on from their own handler, a fence hands
+        // the press to its editor, a table opens a cell — and the page handler
+        // runs *after* them, because it sits on the container. Without this
+        // check the page resolved the same press to the nearest line of prose
+        // and took the focus back, so a click on an image flipped its source on
+        // and off again in the same frame.
+        if self.press_inside_block(position) {
+            return;
+        }
+        let bounds = self.bounds.borrow().clone();
+        let mut best: Option<(usize, Pixels)> = None;
+        for (index, block) in self.blocks.iter().enumerate() {
+            let Some(area) = bounds.get(&block.id) else {
+                continue;
+            };
+            let gap = if position.y < area.top() {
+                area.top() - position.y
+            } else if position.y > area.bottom() {
+                position.y - area.bottom()
+            } else {
+                px(0.)
+            };
+            if best.is_none_or(|(_, closest)| gap < closest) {
+                best = Some((index, gap));
+            }
+        }
+        let Some((index, _)) = best else {
+            return;
+        };
+        let kind = self.blocks[index].kind.clone();
+        // Blocks that bring their own editor — a fence, a table cell, a formula
+        // — are entered by their own click handlers; the page click only hands
+        // them the focus.
+        if kind.is_rule() || kind.is_image() || kind.is_code() || kind.is_table() || kind.is_math() {
+            return;
+        }
+        let below = bounds
+            .get(&self.blocks[index].id)
+            .is_none_or(|area| position.y >= area.top() + area.size.height / 2.);
+        self.focus_block(index, window, cx);
+        let end = self.blocks[index].text.len();
+        self.place_caret(index, if below { end } else { 0 }, window, cx);
     }
 
     /// Nudge a click that landed on the very edge of the run that is open back
@@ -1186,6 +1523,9 @@ impl MeowDown {
             InputEvent::Blur => {
                 if self.active_id == Some(id) && self.lang_focus != Some(id) {
                     self.active_id = None;
+                    // Nothing in this block holds the keyboard any more, so the
+                    // language list it opened goes with the focus.
+                    self.lang_menu = None;
                     // The press that started a drag can be released outside the
                     // block, where its mouse-up is never seen; losing the focus
                     // is the other moment the gesture is definitely over.
@@ -1200,6 +1540,131 @@ impl MeowDown {
                 }
             }
         }
+    }
+
+    /// What a fence's language field currently says.
+    fn lang_query(&self, block: u64, cx: &App) -> String {
+        self.index_of(block)
+            .and_then(|index| self.blocks[index].lang.clone())
+            .map(|field| field.read(cx).value().trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Open the list under a fence's language field.
+    ///
+    /// Opening is the whole point of focusing that field: the set of languages
+    /// a fence can be written in is not something a reader is expected to
+    /// remember — Typora shows it, and so does this.
+    fn open_lang_menu(&mut self, block: u64, cx: &mut Context<Self>) {
+        let rows = lang_matches(&self.lang_query(block, cx));
+        self.lang_menu = Some(LangMenu {
+            block,
+            rows,
+            active: 0,
+            scroll: 0.,
+        });
+        cx.notify();
+    }
+
+    /// Re-read the field and rebuild the rows.
+    ///
+    /// Every keystroke lands here, which is what makes the panel a completion
+    /// rather than a picker: the list narrows as the name is typed, and a row
+    /// that starts with what was typed comes before one that merely mentions it.
+    fn refresh_lang_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(block) = self.lang_menu.as_ref().map(|menu| menu.block) else {
+            return;
+        };
+        let rows = lang_matches(&self.lang_query(block, cx));
+        if let Some(menu) = self.lang_menu.as_mut() {
+            menu.rows = rows;
+            menu.active = 0;
+            menu.scroll = 0.;
+        }
+        cx.notify();
+    }
+
+    fn close_lang_menu(&mut self, cx: &mut Context<Self>) {
+        if self.lang_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Move the keyboard's row, scrolling the list to keep it in sight.
+    ///
+    /// The ends wrap, so holding a key walks the whole list instead of stopping
+    /// dead at the last row.
+    fn lang_menu_step(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(menu) = self.lang_menu.as_mut() else {
+            return;
+        };
+        if menu.rows.is_empty() {
+            return;
+        }
+        let count = menu.rows.len() as isize;
+        menu.active = (menu.active as isize + delta).rem_euclid(count) as usize;
+        let top = menu.active as f32 * LANG_ROW;
+        let view = LANG_ROWS_SHOWN as f32 * LANG_ROW;
+        if top < menu.scroll {
+            menu.scroll = top;
+        } else if top + LANG_ROW > menu.scroll + view {
+            menu.scroll = top + LANG_ROW - view;
+        }
+        cx.notify();
+    }
+
+    /// Put the row the keyboard is on into the field.
+    fn accept_lang_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.lang_menu.as_ref() else {
+            return;
+        };
+        let Some(choice) = menu.rows.get(menu.active).cloned() else {
+            return;
+        };
+        self.choose_lang(choice, window, cx);
+    }
+
+    /// Write a language into the fence.
+    ///
+    /// The field is written first, so what the reader sees is the truth; the
+    /// block follows it through the same path typing would take.
+    fn choose_lang(&mut self, choice: LangChoice, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(block) = self.lang_menu.as_ref().map(|menu| menu.block) else {
+            return;
+        };
+        let Some(index) = self.index_of(block) else {
+            return;
+        };
+        self.remember(block);
+        if let Some(field) = self.blocks[index].lang.clone() {
+            field.update(cx, |state, cx| state.set_value(choice.token.clone(), window, cx));
+            // The press that chose a row took the focus off the box; a language
+            // is often half remembered, and clicking back in to fix a letter
+            // would be a silly little tax.
+            field.update(cx, |state, cx| state.focus(window, cx));
+        }
+        self.set_fence_language(index, Some(choice.token), cx);
+        // Writing the field fires a Change, which would rebuild the list; the
+        // choice is in, so the list has done its job.
+        self.lang_menu = None;
+        cx.notify();
+    }
+
+    /// Point a fence at another language: the block, its highlighter and the
+    /// Markdown all move together.
+    fn set_fence_language(
+        &mut self,
+        index: usize,
+        language: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.blocks[index].kind = BlockKind::Code(language.clone());
+        if let Some(language) = language {
+            let state = self.blocks[index].state.clone();
+            state.update(cx, |state, cx| state.set_highlighter(language, cx));
+        }
+        self.dirty = true;
+        cx.notify();
     }
 
     /// The language field in the corner of a code block.
@@ -1221,24 +1686,28 @@ impl MeowDown {
                 let value = lang.read(cx).value().trim().to_string();
                 self.remember(id);
                 let language = if value.is_empty() { None } else { Some(value) };
-                self.blocks[index].kind = BlockKind::Code(language.clone());
-                if let (Some(state), Some(language)) =
-                    (Some(self.blocks[index].state.clone()), language)
-                {
-                    state.update(cx, |state, cx| state.set_highlighter(language, cx));
+                self.set_fence_language(index, language, cx);
+                // Typing narrows the list; the first keystroke after the escape
+                // key opens it again.
+                if self.lang_menu.is_some() {
+                    self.refresh_lang_menu(cx);
+                } else {
+                    self.open_lang_menu(id, cx);
                 }
-                self.dirty = true;
-                cx.notify();
             }
             InputEvent::Focus => {
                 self.lang_focus = Some(id);
                 self.active_id = Some(id);
-                cx.notify();
+                self.open_lang_menu(id, cx);
             }
             InputEvent::Blur => {
                 if self.lang_focus == Some(id) {
                     self.lang_focus = None;
                 }
+                // The list stays up across the blur on purpose: pressing a row
+                // means leaving the field first, and closing here would take
+                // the row away before the press could land on it. A press
+                // anywhere else goes to the panel's backdrop, which closes it.
                 cx.notify();
             }
             _ => {}
@@ -1575,6 +2044,7 @@ impl MeowDown {
         let block = self.make_block(window, cx, PlainBlock::new(BlockKind::Paragraph, ""));
         self.blocks = vec![block];
         self.path = None;
+        self.sample = false;
         self.dirty = false;
         self.source_mode = false;
         self.focus_first(window, cx);
@@ -1646,7 +2116,12 @@ impl MeowDown {
 
     fn load_from_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         match std::fs::read_to_string(&path) {
-            Ok(source) => self.set_document(&source, Some(path), window, cx),
+            Ok(source) => {
+                // Opened from outside any workspace — the file list follows
+                // the document into its own folder.
+                self.adopt_parent(&path);
+                self.set_document(&source, Some(path), window, cx)
+            }
             Err(err) => {
                 self.hint = format!("打开失败：{err}").into();
                 cx.notify();
@@ -1658,11 +2133,17 @@ impl MeowDown {
         let source = self.current_source(cx);
 
         let Some(path) = self.path.clone() else {
-            let task = cx.background_executor().spawn(async {
-                rfd::FileDialog::new()
+            // A page typed on before any note was picked is saved inside the
+            // folder that is open, not wherever the dialog last pointed.
+            let folder = self.root.clone();
+            let task = cx.background_executor().spawn(async move {
+                let mut dialog = rfd::FileDialog::new()
                     .add_filter("Markdown", &["md"])
-                    .set_file_name("untitled.md")
-                    .save_file()
+                    .set_file_name("untitled.md");
+                if let Some(folder) = folder {
+                    dialog = dialog.set_directory(folder);
+                }
+                dialog.save_file()
             });
 
             cx.spawn_in(window, async move |this, cx| {
@@ -1801,6 +2282,7 @@ impl MeowDown {
             self.last_dir = Some(dir.to_path_buf());
         }
         self.path = path;
+        self.sample = false;
         self.dirty = false;
         self.source_mode = false;
         self.active_id = None;
@@ -1851,6 +2333,79 @@ impl MeowDown {
         let shift = keystroke.modifiers.shift;
         let alt = keystroke.modifiers.alt;
         let key = keystroke.key.to_lowercase();
+
+        // The picture viewer is the topmost thing on screen. While it is up it
+        // owns every key, so nothing typed at it reaches the document behind —
+        // and the keys that move around inside it do that instead.
+        if self.viewer.is_some() {
+            let viewport = window.viewport_size();
+            let middle = point(viewport.width / 2.0, viewport.height / 2.0);
+            match key.as_str() {
+                "escape" => self.close_viewer(cx),
+                "left" => self.viewer_step(-1, cx),
+                "right" => self.viewer_step(1, cx),
+                "=" | "+" | "add" => self.viewer_zoom(1.25, middle, viewport, cx),
+                "-" | "_" | "subtract" => self.viewer_zoom(0.8, middle, viewport, cx),
+                "0" => self.viewer_reset(cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+
+        // The language list is the popup half of the field that holds the
+        // keyboard: Escape puts it away, Enter takes the row it is on, and Up
+        // and Down walk it (as actions, so they never reach this far).
+        if self.lang_menu.is_some() {
+            match key.as_str() {
+                "escape" => {
+                    self.close_lang_menu(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "enter" => {
+                    self.accept_lang_row(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // The file menu is dismissed by Escape, and a prompt owns the keyboard
+        // while it is up — including Enter, which is its "确定".
+        if self.menu.is_some() && key == "escape" {
+            self.close_menu(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.prompt.is_some() {
+            if key == "escape" {
+                self.close_prompt(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if key == "enter" && !shift && !command && !alt {
+                self.commit_prompt(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            // Everything else belongs to the field inside the prompt.
+            return;
+        }
+
+        // The close question owns the keyboard while it is on screen: Enter
+        // saves, Escape calls the whole thing off, and nothing else reaches the
+        // page underneath.
+        if self.close_prompt {
+            match key.as_str() {
+                "enter" => self.save_and_close(window, cx),
+                "escape" => self.cancel_close(window, cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
 
         // The settings dialog owns the keyboard while it is open; only Escape
         // still belongs to the document.
@@ -1982,8 +2537,7 @@ impl MeowDown {
                     cx.stop_propagation();
                 }
                 "l" => {
-                    self.sidebar_visible = !self.sidebar_visible;
-                    cx.notify();
+                    self.toggle_sidebar(cx);
                     cx.stop_propagation();
                 }
                 _ => {}
@@ -2029,7 +2583,7 @@ impl MeowDown {
                     cx.stop_propagation();
                 }
                 "w" => {
-                    window.remove_window();
+                    self.request_close(window, cx);
                     cx.stop_propagation();
                 }
                 "," => {
@@ -2166,6 +2720,20 @@ impl MeowDown {
 
     /// Save to a new file, always asking for the path.
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_as_then(window, cx, |_, _, _| {});
+    }
+
+    /// Ask the file manager where the document should go, write it there, and
+    /// hand the result to `then`.
+    ///
+    /// The dialog is the only way to name a file that has no path yet, so both
+    /// "另存为" and the save half of the close question come through here; the
+    /// close question needs the follow-up, because whether the window may shut
+    /// depends on the write having gone through.
+    fn save_as_then<F>(&mut self, window: &mut Window, cx: &mut Context<Self>, then: F)
+    where
+        F: FnOnce(&mut MeowDown, &mut Window, &mut Context<MeowDown>) + 'static,
+    {
         let source = if self.source_mode {
             self.source.read(cx).value().to_string()
         } else {
@@ -2178,20 +2746,117 @@ impl MeowDown {
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "untitled.md".to_string());
 
+        // "另存为" starts where the note lives, or in the folder that is open.
+        let folder = self
+            .path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .or(self.root.as_deref())
+            .map(|dir| dir.to_path_buf());
+
         let task = cx.background_executor().spawn(async move {
-            rfd::FileDialog::new()
+            let mut dialog = rfd::FileDialog::new()
                 .add_filter("Markdown", &["md"])
-                .set_file_name(suggested)
-                .save_file()
+                .set_file_name(suggested);
+            if let Some(folder) = folder {
+                dialog = dialog.set_directory(folder);
+            }
+            dialog.save_file()
         });
         cx.spawn_in(window, async move |this, cx| {
             let Some(path) = task.await else {
                 return;
             };
-            this.update_in(cx, |this, window, cx| this.write_to(path, source, window, cx))
-                .ok();
+            this.update_in(cx, |this, window, cx| {
+                this.write_to(path, source, window, cx);
+                then(this, window, cx);
+            })
+            .ok();
         })
         .detach();
+    }
+
+    // ---------------------------------------------------------------- closing
+
+    /// Whether closing the window would throw away something typed.
+    ///
+    /// A page that was typed into and emptied again is not worth a question:
+    /// there is nothing in it that was not in a blank document already.
+    fn unsaved(&self) -> bool {
+        self.dirty && !self.is_blank()
+    }
+
+    /// The platform is about to close the window. `true` lets it go.
+    ///
+    /// This runs inside the platform's own close handling, so the window must
+    /// not be taken down from here — the answer is only "yes, go" or "no, ask
+    /// first". Everything that closes the window *after* an answer goes
+    /// through `window.remove_window()` on a normal click instead.
+    fn before_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.unsaved() {
+            return true;
+        }
+        self.ask_before_closing(window, cx);
+        false
+    }
+
+    /// Close, or ask first. Used by the 退出 menu item and Ctrl+W, which are
+    /// ours and never reach the platform's close handler.
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.unsaved() {
+            window.remove_window();
+            return;
+        }
+        self.ask_before_closing(window, cx);
+    }
+
+    /// Put the question on screen and take the keyboard away from the page.
+    ///
+    /// The card becomes the focused node, and that is not cosmetic: with the
+    /// caret still in a paragraph, Enter arrives as text and the field turns it
+    /// into a line break before any key listener sees it — a "save this?" Enter
+    /// would quietly edit the document it is asking about. Focus also keeps the
+    /// keys on a path this view is on, which is where the answer is read.
+    fn ask_before_closing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_prompt = true;
+        window.focus(&self.close_focus, cx);
+        cx.notify();
+    }
+
+    /// 保存: write the document out, then let the window go.
+    ///
+    /// A document with a path is written straight back to it. One without is
+    /// sent through the file manager first, and only closes once the file
+    /// exists — a cancelled dialog leaves the window and the text where they
+    /// were.
+    fn save_and_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_prompt = false;
+        if let Some(path) = self.path.clone() {
+            let source = self.current_source(cx);
+            self.write_to(path, source, window, cx);
+            if !self.dirty {
+                window.remove_window();
+            }
+            return;
+        }
+        self.save_as_then(window, cx, |this, window, _cx| {
+            if !this.dirty {
+                window.remove_window();
+            }
+        });
+    }
+
+    /// 丢弃: drop what was typed and close.
+    fn discard_and_close(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        self.close_prompt = false;
+        window.remove_window();
+    }
+
+    /// 取消: forget the question and keep editing.
+    fn cancel_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_prompt = false;
+        self.return_to_document(window, cx);
+        cx.notify();
     }
 
     // --------------------------------------------------------------- helpers
@@ -2217,6 +2882,14 @@ impl MeowDown {
             .path
             .as_ref()
             .and_then(|path| path.file_name())
+            // A folder with no note picked yet is titled after the folder: it
+            // is what is open, and "未命名.md" would suggest a document is.
+            .or_else(|| {
+                self.root
+                    .as_ref()
+                    .and_then(|root| root.file_name())
+                    .filter(|_| self.path.is_none())
+            })
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "未命名.md".to_string());
         Some(format!(
@@ -2245,7 +2918,14 @@ impl MeowDown {
         self.blocks
             .iter()
             .filter_map(|block| match block.kind {
-                BlockKind::Heading(level) => Some((block.id, level, block.text.clone())),
+                // The outline is a list of names, not prose: `## 见 [文档](url)`
+                // reads as `见 文档` here — the same words the heading itself
+                // shows, with none of the syntax that puts them in a style.
+                BlockKind::Heading(level) => Some((
+                    block.id,
+                    level,
+                    SharedString::from(model::strip_inline_markup(&block.text)),
+                )),
                 _ => None,
             })
             .collect()
@@ -2268,11 +2948,56 @@ impl MeowDown {
             }
         }
         self.sidebar_tab = tab;
-        self.sidebar_visible = true;
+        // Picking a tab from the menu can also be the way the panel comes back
+        // after being folded away, so it unfolds with the same glide.
+        self.set_sidebar_open(true, cx);
         if tab == SidebarTab::Files {
             self.folder_scan_at = None;
         }
         cx.notify();
+    }
+
+    /// Show or fold away the side panel, gliding instead of snapping.
+    ///
+    /// `sidebar_visible` records the destination at once so a second toggle
+    /// knows where the panel was heading; the slide always starts from the
+    /// width it has right now, so interrupting one mid-flight turns it around
+    /// from where it is rather than jumping to the far end first.
+    fn set_sidebar_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        let target = if open { 1. } else { 0. };
+        self.sidebar_visible = open;
+        if (self.sidebar_pos - target).abs() > 0.001 {
+            self.sidebar_anim = Some(Slide {
+                from: self.sidebar_pos,
+                to: target,
+                start: Instant::now(),
+                duration: SIDEBAR_SLIDE,
+            });
+        }
+        cx.notify();
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        let open = !self.sidebar_visible;
+        self.set_sidebar_open(open, cx);
+    }
+
+    /// The panel's width this frame, in pixels. Advancing the slide here — in
+    /// the render pass, driven by `request_animation_frame` — is what keeps it
+    /// smooth and free of timers: each frame moves it a little further along
+    /// the curve, and the frames stop when it lands.
+    fn sidebar_width(&mut self, window: &mut Window) -> f32 {
+        if let Some(slide) = self.sidebar_anim {
+            let (value, done) = slide.value_at(Instant::now());
+            self.sidebar_pos = value;
+            if done {
+                self.sidebar_pos = slide.to;
+                self.sidebar_anim = None;
+            } else {
+                window.request_animation_frame();
+            }
+        }
+        SIDEBAR_WIDTH * self.sidebar_pos
     }
 
     /// Switches the panel without gliding: used when the tab changes as a side
@@ -2298,11 +3023,16 @@ impl MeowDown {
             .unwrap_or_else(|| self.doc_dir())
     }
 
-    /// Markdown files under [`Self::file_dir`] — the whole tree when a folder
-    /// was opened, just the sibling files otherwise. The folder is re-read at
-    /// most every [`FOLDER_RESCAN`] so a file added in Explorer shows up
-    /// without a refresh button, and immediately when the document moves.
-    fn sibling_documents(&mut self) -> Vec<PathBuf> {
+    /// Markdown files directly under [`Self::file_dir`] — one level, never the
+    /// whole tree. A note opened on its own counts as a workspace (its folder
+    /// is the one it came from), so the flat list is left to a document that
+    /// was saved somewhere with no folder opened behind it.
+    ///
+    /// The folder is re-read at most every [`FOLDER_RESCAN`] so a file added in
+    /// Explorer shows up without a refresh button, and immediately when the
+    /// document moves. Reading a level is cheap; reading every level was not,
+    /// which is why the tree below stays unread until it is opened.
+    fn refresh_siblings(&mut self) {
         let dir = self.file_dir();
         let deep = self.root.is_some();
         let moved = self.folder_dir.as_deref() != Some(dir.as_path()) || self.folder_deep != deep;
@@ -2313,26 +3043,24 @@ impl MeowDown {
             self.folder_dir = Some(dir.clone());
             self.folder_deep = deep;
             self.folder_scan_at = Some(Instant::now());
-            self.folder_files = if deep {
-                markdown_files_deep(&dir)
-            } else {
-                markdown_files(&dir)
-            };
+            self.folder_files = markdown_files(&dir);
             self.tree = if deep {
                 Some(folder_tree(&dir))
             } else {
                 None
             };
-            // The file being edited should be visible without hunting for it.
+            // The file being edited should be visible without hunting for it;
+            // `reveal_in_tree` also reads back the branches the panel had open,
+            // which the rebuild has just emptied.
             if let Some(current) = self.path.clone() {
                 self.reveal_in_tree(&current);
             }
         }
-        self.folder_files.clone()
     }
 
     /// Open every folder between the workspace root and `path`, so the current
-    /// document shows up in the list.
+    /// document shows up in the list — and read those levels, which the tree
+    /// does not have until someone asks for them.
     fn reveal_in_tree(&mut self, path: &Path) {
         let Some(root) = self.root.clone() else {
             return;
@@ -2349,6 +3077,71 @@ impl MeowDown {
             }
             cursor = dir.parent();
         }
+        self.sync_tree();
+    }
+
+    /// Read every branch the panel is showing open.
+    ///
+    /// Expansion lives in `expanded`, not in the tree, so a rebuilt tree knows
+    /// nothing below its top level: this walks the open paths again and reads
+    /// along them. Called after every rebuild and every expand.
+    fn sync_tree(&mut self) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let open: Vec<PathBuf> = self
+            .expanded
+            .iter()
+            .filter(|path| path.starts_with(&root))
+            .cloned()
+            .collect();
+        let Some(tree) = self.tree.as_mut() else {
+            return;
+        };
+        tree.load();
+        for path in open {
+            tree.load_path(&path);
+        }
+    }
+
+    /// Bring the folder a loose document lives in into the side panel.
+    ///
+    /// A document with no workspace behind it — opened from Explorer, through
+    /// 打开文件, or picked out of a flat list of siblings — carries its folder
+    /// with it. A workspace that is already open is the user's own choice and
+    /// is left untouched; so is a bare `note.md`, which has no folder worth
+    /// listing.
+    fn adopt_parent(&mut self, path: &Path) {
+        if self.root.is_some() {
+            return;
+        }
+        let Some(dir) = path.parent().filter(|dir| dir.is_dir()) else {
+            return;
+        };
+        self.adopt_root(dir.to_path_buf());
+        self.reveal_in_tree(path);
+    }
+
+    /// Adopt `dir` as the folder the side panel lists, leaving the document
+    /// alone.
+    ///
+    /// Both ways a document can arrive — a folder named on the command line, a
+    /// note opened from Explorer — come through here: the panel reads the
+    /// folder as a tree and switches to the file list, because the files beside
+    /// the one that opened are what a reader is most likely to want next.
+    ///
+    /// Only the top level is read. A crowded parent folder — a home directory,
+    /// a project root — is exactly where a full walk hurts most, and nothing
+    /// below the top is on screen until a folder is opened.
+    fn adopt_root(&mut self, dir: PathBuf) {
+        self.folder_files = markdown_files(&dir);
+        self.folder_dir = Some(dir.clone());
+        self.folder_deep = true;
+        self.folder_scan_at = Some(Instant::now());
+        self.tree = Some(folder_tree(&dir));
+        self.last_dir = Some(dir.clone());
+        self.root = Some(dir);
+        self.snap_sidebar_tab(SidebarTab::Files);
     }
 
     /// Pick a folder and list every Markdown file inside it, at any depth.
@@ -2372,8 +3165,8 @@ impl MeowDown {
 
     /// Adopt `dir` as the folder the side panel lists.
     fn use_folder(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let files = markdown_files_deep(&dir);
-        self.folder_files = files.clone();
+        // Top level only: what is below it is read when a folder is opened.
+        self.folder_files = markdown_files(&dir);
         self.folder_dir = Some(dir.clone());
         self.folder_deep = true;
         // Let the next repaint read the folder again, which is also what builds
@@ -2382,22 +3175,22 @@ impl MeowDown {
         self.tree = None;
         self.expanded.clear();
         self.last_dir = Some(dir.clone());
+        let name = folder_name(&dir);
         self.root = Some(dir);
         self.snap_sidebar_tab(SidebarTab::Files);
+        // Opening a folder puts the panel back without a glide: the folder is
+        // the thing the user acted on, and watching the panel unfold on top of
+        // that just delays the list they asked for.
         self.sidebar_visible = true;
-        // A cold start on the sample document jumps straight into the folder,
-        // so opening one is not a no-op the user has to follow with a click.
-        let cold = self.path.is_none() && !self.dirty;
-        match (cold, files.first()) {
-            (true, Some(first)) => {
-                let first = first.clone();
-                self.load_from_path(first, window, cx);
-                self.hint = "已打开文件夹".into();
-            }
-            _ => {
-                self.hint = format!("已打开文件夹 · {} 个 Markdown 文件", files.len()).into();
-            }
+        self.sidebar_pos = 1.;
+        self.sidebar_anim = None;
+        // The folder is what was opened, so no note is picked for the user.
+        // A page still showing the untouched sample gives way to a blank one —
+        // otherwise the sample reads as a note that came out of this folder.
+        if self.path.is_none() && !self.dirty {
+            self.set_document("", None, window, cx);
         }
+        self.hint = format!("已打开文件夹 · {name}").into();
         cx.notify();
     }
 
@@ -2511,7 +3304,14 @@ impl MeowDown {
         self.blocks
             .iter()
             .find(|block| {
-                matches!(block.kind, BlockKind::Heading(_)) && anchor_key(&block.text) == wanted
+                if !matches!(block.kind, BlockKind::Heading(_)) {
+                    return false;
+                }
+                // A heading can be written with syntax the reader never sees:
+                // `## 见 [文档](url)` should still answer to `#见-文档`, which
+                // is the name the outline lists.
+                anchor_key(&block.text) == wanted
+                    || anchor_key(&model::strip_inline_markup(&block.text)) == wanted
             })
             .map(|block| block.id)
     }
@@ -2586,6 +3386,145 @@ impl MeowDown {
             .ok();
         })
         .detach();
+    }
+
+    /// Note a press on the picture of `block`, so the press that follows it —
+    /// the second half of a double click — can be recognised even after the
+    /// block has made room for its source and the picture has moved.
+    fn note_picture_press(&mut self, block: u64) {
+        self.picture_press = Some((block, Instant::now()));
+    }
+
+    /// Whether the press just seen completes a double click on the picture of
+    /// `block`. The platform only reports a second click within its own
+    /// double-click time and distance, so a remembered press of the same block
+    /// that is still fresh is the other half of this gesture.
+    fn picture_double_clicked(&mut self, block: u64) -> bool {
+        let Some((pressed, at)) = self.picture_press.take() else {
+            return false;
+        };
+        pressed == block && at.elapsed() <= Duration::from_millis(1200)
+    }
+
+    /// Open the picture of `block` full-window, with every other picture of the
+    /// document queued behind it.
+    ///
+    /// A picture with no source, or one whose path is empty, is not something
+    /// to look at: the press on it does what it always did and just shows the
+    /// Markdown, so the path can be fixed. Returns whether the viewer opened.
+    fn open_viewer(&mut self, block: u64, cx: &mut Context<Self>) -> bool {
+        let mut items: Vec<ViewerItem> = Vec::new();
+        for candidate in &self.blocks {
+            if !candidate.kind.is_image() {
+                continue;
+            }
+            let Some(image) = model::parse_image(&candidate.text) else {
+                continue;
+            };
+            let src = image.src.trim().to_string();
+            if src.is_empty() {
+                continue;
+            }
+            items.push(ViewerItem {
+                block: candidate.id,
+                src,
+                alt: image.alt,
+            });
+        }
+        let Some(at) = items.iter().position(|item| item.block == block) else {
+            return false;
+        };
+        self.viewer = Some(Viewer {
+            items,
+            at,
+            zoom: 1.0,
+            offset: point(px(0.), px(0.)),
+            drag: None,
+        });
+        cx.notify();
+        true
+    }
+
+    fn close_viewer(&mut self, cx: &mut Context<Self>) {
+        self.viewer = None;
+        cx.notify();
+    }
+
+    /// Step to the next or the previous picture, wrapping at both ends so the
+    /// arrows never turn into dead buttons.
+    fn viewer_step(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        viewer.at = wrapped_index(viewer.at, delta, viewer.items.len());
+        viewer.zoom = 1.0;
+        viewer.offset = point(px(0.), px(0.));
+        viewer.drag = None;
+        cx.notify();
+    }
+
+    /// Zoom by a factor around a point of the window, which stays put: the
+    /// picture grows away from the pointer instead of from the middle, which is
+    /// what makes zooming into a detail feel like it goes where it is aimed.
+    fn viewer_zoom(&mut self, factor: f32, anchor: Point<Pixels>, viewport: Size<Pixels>, cx: &mut Context<Self>) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        let zoom = (viewer.zoom * factor).clamp(VIEWER_MIN_ZOOM, VIEWER_MAX_ZOOM);
+        if (zoom - viewer.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        let center = point(viewport.width / 2.0, viewport.height / 2.0);
+        viewer.offset = zoomed_offset(viewer.offset, anchor, center, zoom / viewer.zoom);
+        viewer.zoom = zoom;
+        cx.notify();
+    }
+
+    /// Back to the picture as it was opened: fitted, in the middle.
+    fn viewer_reset(&mut self, cx: &mut Context<Self>) {
+        let Some(viewer) = self.viewer.as_mut() else {
+            return;
+        };
+        viewer.zoom = 1.0;
+        viewer.offset = point(px(0.), px(0.));
+        cx.notify();
+    }
+
+    /// Clicking the dimmed room around a picture closes the viewer; clicking
+    /// the picture itself does not, so a miss while dragging costs nothing.
+    fn viewer_backdrop_clicked(&mut self, at: Point<Pixels>, viewport: Size<Pixels>, cx: &mut Context<Self>) {
+        let Some(viewer) = self.viewer.as_ref() else {
+            return;
+        };
+        let src = viewer.items[viewer.at].src.clone();
+        let (zoom, offset) = (viewer.zoom, viewer.offset);
+        // Without the intrinsic size the picture's own rectangle is unknown, so
+        // a click cannot be told from a click on the room around it; Escape and
+        // the close button still work.
+        let Some(image) = self.image_size(&src) else {
+            return;
+        };
+        let area = viewer_bounds(image, viewport, zoom, offset);
+        if at.x < area.left() || at.x > area.right() || at.y < area.top() || at.y > area.bottom() {
+            self.close_viewer(cx);
+        }
+    }
+
+    /// The size the picture was written at, read from the file once and kept.
+    fn image_size(&mut self, src: &str) -> Option<Size<f32>> {
+        if let Some(size) = self.image_sizes.get(src) {
+            return Some(*size);
+        }
+        let (width, height) = if is_remote(src) {
+            let image = self.remote_images.get(src)?;
+            image_size_from_bytes(&image.bytes)?
+        } else {
+            let path = self.resolve_image(src)?;
+            image::image_dimensions(path).ok()?
+        };
+        let size = size(width as f32, height as f32);
+        self.image_sizes.insert(src.to_string(), size);
+        Some(size)
     }
 
     fn insert_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3498,7 +4437,7 @@ impl MeowDown {
             return false;
         }
         // The language field is a separate one-line input.
-        if self.lang_focus == Some(self.blocks[index].id) {
+        if self.lang_focus == Some(self.blocks[index].id) || self.lang_menu.is_some() {
             return false;
         }
         let single_line = !self.blocks[index].text.contains('\n');
@@ -3515,13 +4454,42 @@ impl MeowDown {
     }
 
     fn on_move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+        // Up and Down walk the language list while it is open — the field
+        // itself is one line long, so the keys would otherwise do nothing.
+        if self.lang_menu.is_some() {
+            self.lang_menu_step(-1, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.arrow_step(true, window, cx) {
             cx.stop_propagation();
         }
     }
 
     fn on_move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lang_menu.is_some() {
+            self.lang_menu_step(1, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.arrow_step(false, window, cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Left and right are the viewer's while it is up, and the field's
+    /// otherwise. They arrive as actions rather than key presses, so this is
+    /// the only place they can be taken away from the paragraph behind.
+    fn on_move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.is_some() {
+            self.viewer_step(-1, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    fn on_move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.is_some() {
+            self.viewer_step(1, cx);
             cx.stop_propagation();
         }
     }
@@ -3529,7 +4497,7 @@ impl MeowDown {
     /// Intercept Ctrl+V before the focused field swallows it, so a screenshot on
     /// the clipboard turns into an image block instead of being ignored.
     fn on_paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if self.show_settings || self.lang_focus.is_some() {
+        if self.show_settings || self.lang_focus.is_some() || self.viewer.is_some() {
             return;
         }
         if self.paste_clipboard_image(window, cx) {
@@ -3624,6 +4592,68 @@ enum RemoteState {
 fn is_remote(src: &str) -> bool {
     let lower = src.trim().to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("data:")
+}
+
+/// The width and height a picture was encoded at, read from its bytes without
+/// decoding the pixels — a header read, not a full decode.
+fn image_size_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.into_dimensions().ok()
+}
+
+/// Where the next picture is, wrapping at both ends.
+fn wrapped_index(at: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len = len as i32;
+    (((at as i32 + delta) % len) + len) as usize % len as usize
+}
+
+/// How much a picture is scaled by to fit the window: it shrinks to fit, and a
+/// picture already smaller than the window is left at its own size — blowing a
+/// 64px icon up to fill the screen only makes it blurry.
+fn viewer_fit(image: Size<f32>, viewport: Size<Pixels>) -> f32 {
+    let room_w = (viewport.width.as_f32() - VIEWER_PAD * 2.0).max(1.0);
+    let room_h = (viewport.height.as_f32() - VIEWER_PAD * 2.0).max(1.0);
+    let fit = (room_w / image.width).min(room_h / image.height);
+    fit.min(1.0).max(0.01)
+}
+
+/// The rectangle the picture occupies at a given zoom and offset.
+fn viewer_bounds(
+    image: Size<f32>,
+    viewport: Size<Pixels>,
+    zoom: f32,
+    offset: Point<Pixels>,
+) -> Bounds<Pixels> {
+    let scale = viewer_fit(image, viewport) * zoom;
+    let width = image.width * scale;
+    let height = image.height * scale;
+    let left = (viewport.width.as_f32() - width) / 2.0 + offset.x.as_f32();
+    let top = (viewport.height.as_f32() - height) / 2.0 + offset.y.as_f32();
+    Bounds::new(point(px(left), px(top)), size(px(width), px(height)))
+}
+
+/// The offset that keeps the point under `anchor` where it is while the
+/// picture grows by `factor`. Everything is measured from the middle of the
+/// window, which is where the picture is centred when the offset is zero.
+fn zoomed_offset(
+    offset: Point<Pixels>,
+    anchor: Point<Pixels>,
+    center: Point<Pixels>,
+    factor: f32,
+) -> Point<Pixels> {
+    let rel = point(
+        anchor.x - center.x - offset.x,
+        anchor.y - center.y - offset.y,
+    );
+    point(
+        offset.x - rel.x * (factor - 1.0),
+        offset.y - rel.y * (factor - 1.0),
+    )
 }
 
 fn is_divider(text: &str) -> bool {
@@ -3753,6 +4783,23 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Whether a directory entry names a folder, and whether it names a file.
+///
+/// Asked of the entry rather than of its path: `is_dir`/`is_file` cost a `stat`
+/// per name — around 130 ms for six thousand notes in one folder, against 2 ms
+/// for the type that comes with the listing. A link is the one case that still
+/// has to be followed.
+fn entry_flags(entry: &std::fs::DirEntry) -> (bool, bool) {
+    match entry.file_type() {
+        Ok(kind) if kind.is_symlink() => {
+            let path = entry.path();
+            (path.is_dir(), path.is_file())
+        }
+        Ok(kind) => (kind.is_dir(), kind.is_file()),
+        Err(_) => (false, false),
+    }
+}
+
 /// Every Markdown file directly inside `dir`, sorted by name.
 fn markdown_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -3760,8 +4807,9 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
+        .filter(|entry| entry_flags(entry).1)
         .map(|entry| entry.path())
-        .filter(|path| path.is_file() && is_markdown(path))
+        .filter(|path| is_markdown(path))
         .collect();
     files.sort_by(|a, b| {
         file_name(a)
@@ -3782,63 +4830,101 @@ fn skip_dir(path: &Path) -> bool {
         )
 }
 
-/// One directory in the side panel's tree: the folders under it that hold
-/// Markdown, and the Markdown files directly inside it.
+/// One directory in the side panel's tree: the folders under it, and the
+/// Markdown files directly inside it.
+///
+/// A node is a *stub* until someone opens it: it knows its name and path, but
+/// `dirs` and `files` stay empty until [`Self::load`] reads the directory. A
+/// folder holding a thousand notes across a dozen levels used to be walked in
+/// full before the first frame was drawn — and then walked again on every
+/// rescan, which is what made a busy parent folder feel like a hung program.
+/// Now each level is read when it is shown, and not before.
 struct TreeNode {
     name: String,
     path: PathBuf,
     dirs: Vec<TreeNode>,
     files: Vec<PathBuf>,
+    /// Whether `dirs` and `files` came from the disk. An unread node may well
+    /// hold something, so it is never drawn as empty.
+    loaded: bool,
 }
 
 impl TreeNode {
-    fn file_count(&self) -> usize {
-        self.files.len()
-            + self
-                .dirs
-                .iter()
-                .map(|child| child.file_count())
-                .sum::<usize>()
+    fn stub(path: &Path) -> TreeNode {
+        TreeNode {
+            name: folder_name(path),
+            path: path.to_path_buf(),
+            dirs: Vec::new(),
+            files: Vec::new(),
+            loaded: false,
+        }
     }
-}
 
-/// Read `root` into a tree. Folders that hold no Markdown anywhere below them
-/// are dropped, so the list never leads to an empty branch.
-fn folder_tree(root: &Path) -> TreeNode {
-    build_tree(root, folder_name(root), 0)
-}
-
-fn build_tree(dir: &Path, name: String, depth: usize) -> TreeNode {
-    const MAX_DEPTH: usize = 12;
-    let mut node = TreeNode {
-        name,
-        path: dir.to_path_buf(),
-        dirs: Vec::new(),
-        files: Vec::new(),
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return node;
-    };
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for entry in entries.filter_map(|entry| entry.ok()) {
-        let path = entry.path();
-        if path.is_dir() {
-            if depth < MAX_DEPTH && !skip_dir(&path) {
-                dirs.push(path);
+    /// Read this level from the disk, once.
+    ///
+    /// `loaded` is set before the read: a folder that cannot be read stays an
+    /// empty level rather than being retried on every frame.
+    fn load(&mut self) {
+        if self.loaded {
+            return;
+        }
+        self.loaded = true;
+        let Ok(entries) = std::fs::read_dir(&self.path) else {
+            return;
+        };
+        // Every folder inside is kept, even one that holds no Markdown at all:
+        // a folder the user made should not go missing from the list just
+        // because it is empty or only holds images.
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            let (is_dir, is_file) = entry_flags(&entry);
+            if is_dir {
+                if !skip_dir(&path) {
+                    dirs.push(path);
+                }
+            } else if is_file && is_markdown(&path) {
+                self.files.push(path);
             }
-        } else if path.is_file() && is_markdown(&path) {
-            node.files.push(path);
+        }
+        self.files
+            .sort_by_key(|path| file_name(path).to_lowercase());
+        dirs.sort_by_key(|path| folder_name(path).to_lowercase());
+        self.dirs = dirs.iter().map(|path| TreeNode::stub(path)).collect();
+    }
+
+    /// Read every level between here and `path`, so a branch that is open has
+    /// something in it again after the tree has been rebuilt.
+    fn load_path(&mut self, path: &Path) {
+        self.load();
+        for child in &mut self.dirs {
+            if path.starts_with(&child.path) {
+                child.load_path(path);
+                break;
+            }
         }
     }
-    node.files
-        .sort_by_key(|path| file_name(path).to_lowercase());
-    dirs.sort_by_key(|path| folder_name(path).to_lowercase());
-    for path in dirs {
-        let child = build_tree(&path, folder_name(&path), depth + 1);
-        if child.file_count() > 0 {
-            node.dirs.push(child);
-        }
+
+    /// Markdown files in this folder alone. `None` until the folder has been
+    /// read: not knowing is the whole point of the lazy tree.
+    fn file_count(&self) -> Option<usize> {
+        self.loaded.then_some(self.files.len())
     }
+
+    /// A folder known to have nothing to show: no Markdown of its own and no
+    /// subfolder either. It stays in the list — dimmed and unopenable — so the
+    /// tree keeps matching what the disk actually has. A folder that has not
+    /// been read is never called empty.
+    fn shows_nothing(&self) -> bool {
+        self.loaded && self.dirs.is_empty() && self.files.is_empty()
+    }
+}
+
+/// The tree for `root`, with its top level already read: the panel always
+/// shows that much.
+fn folder_tree(root: &Path) -> TreeNode {
+    let mut node = TreeNode::stub(root);
+    node.load();
     node
 }
 
@@ -3848,37 +4934,17 @@ fn folder_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// Every Markdown file under `root`, at any depth, sorted by relative path so
-/// the listing reads like a tree walked top-down.
-fn markdown_files_deep(root: &Path) -> Vec<PathBuf> {
-    const MAX_DEPTH: usize = 12;
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
-    while let Some((dir, depth)) = queue.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(|entry| entry.ok()) {
-            let path = entry.path();
-            if path.is_dir() {
-                if depth < MAX_DEPTH && !skip_dir(&path) {
-                    queue.push((path, depth + 1));
-                }
-            } else if path.is_file() && is_markdown(&path) {
-                files.push(path);
-            }
-        }
-    }
-    files.sort_by(|a, b| {
-        let key = |path: &Path| {
-            path.strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_lowercase()
-        };
-        key(a).cmp(&key(b))
-    });
-    files
+/// A stable, allocation-free id for a row's path.
+///
+/// `ElementId::Name(format!("file:{}", path.display()))` is the obvious spelling
+/// and it was the one used here; with a few thousand notes in a folder it also
+/// meant a few thousand formatted strings on every frame, which is lag you can
+/// feel while typing.
+fn path_id(path: &Path) -> ElementId {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    ElementId::Integer(hasher.finish())
 }
 
 /// Path of `path` relative to `root`, with forward slashes so it reads the same
@@ -3888,6 +4954,339 @@ fn relative_label(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+// ------------------------------------------------------------ file tree pieces
+
+/// Height of one entry in the file menu.
+const MENU_ROW: f32 = 27.;
+/// Width of the file menu panel.
+const MENU_WIDTH: f32 = 208.;
+
+// -------------------------------------------------------- language drop-down
+
+/// Width of the panel that lists the languages a fence can be written in.
+const LANG_PANEL_WIDTH: f32 = 224.;
+/// Height of one language in that panel.
+const LANG_ROW: f32 = 25.;
+/// How many languages are in sight before the list starts to scroll. Eight is
+/// about the height of a code block's own corner, so the panel covers the code
+/// it belongs to and no more.
+const LANG_ROWS_SHOWN: usize = 8;
+
+/// Every language a fence can be written in, in the order the list shows them.
+///
+/// This is the very set the code editor highlights with, so nothing is offered
+/// that the fence could not then colour. It is built on the first open rather
+/// than at startup: the dump holds a couple of hundred syntaxes and unpacking
+/// it costs more than drawing the window.
+fn all_languages() -> &'static [LangChoice] {
+    static ALL: OnceLock<Vec<LangChoice>> = OnceLock::new();
+    ALL.get_or_init(|| {
+        let syntaxes = two_face::syntax::extra_newlines();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut list: Vec<LangChoice> = Vec::new();
+        for syntax in syntaxes.syntaxes() {
+            // The plain-text fallback is the absence of a language, not one of
+            // the choices.
+            if syntax.name == "Plain Text" {
+                continue;
+            }
+            // The first extension is the canonical token: `rs`, `py`, `cpp`.
+            // A syntax without one cannot be named in a fence at all.
+            let Some(token) = syntax.file_extensions.first().filter(|ext| !ext.is_empty()) else {
+                continue;
+            };
+            if !seen.insert(token.clone()) {
+                continue;
+            }
+            list.push(LangChoice {
+                token: token.clone(),
+                name: syntax.name.clone(),
+            });
+        }
+        list.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+        list
+    })
+}
+
+/// The rows that match what has been typed into the field.
+///
+/// Matching is what matters, ordering is the polish: a row that starts with what
+/// was typed comes before one that merely contains it, and a fence token before
+/// a display name — so "c" offers C, C++ and C# up front, and `Arduino C`
+/// further down, instead of burying the short names under the long ones.
+fn lang_matches(query: &str) -> Vec<LangChoice> {
+    let query = query.trim().to_ascii_lowercase();
+    let all = all_languages();
+    if query.is_empty() {
+        return all.to_vec();
+    }
+    let mut scored: Vec<(u8, LangChoice)> = all
+        .iter()
+        .filter_map(|choice| {
+            let token = choice.token.to_ascii_lowercase();
+            let name = choice.name.to_ascii_lowercase();
+            let rank = if token == query {
+                0
+            } else if token.starts_with(&query) {
+                1
+            } else if name.starts_with(&query) {
+                2
+            } else if token.contains(&query) {
+                3
+            } else if name.contains(&query) {
+                4
+            } else {
+                return None;
+            };
+            Some((rank, choice.clone()))
+        })
+        .collect();
+    // The sort is stable, so rows of equal rank keep the list's own (name)
+    // order instead of shuffling on every keystroke.
+    scored.sort_by_key(|(rank, _)| *rank);
+    scored.into_iter().map(|(_, choice)| choice).collect()
+}
+
+/// One command in the file menu. The listener closes the menu first, so the
+/// panel is gone before whatever it opened is drawn on top.
+fn menu_item<F>(
+    label: &'static str,
+    theme: &ThemeColor,
+    cx: &mut Context<MeowDown>,
+    run: F,
+) -> AnyElement
+where
+    F: Fn(&mut MeowDown, &mut Window, &mut Context<MeowDown>) + 'static,
+{
+    div()
+        .id(SharedString::from(format!("file-menu-{label}")))
+        .flex()
+        .items_center()
+        .w_full()
+        .h(px(MENU_ROW))
+        .mx(px(4.))
+        .px_2()
+        .rounded(px(5.))
+        .text_sm()
+        .text_color(theme.foreground)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.sidebar_accent))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                this.menu = None;
+                run(this, window, cx);
+            }),
+        )
+        .child(label)
+        .into_any_element()
+}
+
+/// The hairline between groups of commands.
+fn menu_rule(theme: &ThemeColor) -> AnyElement {
+    div()
+        .mx_2()
+        .my(px(3.))
+        .h(px(1.))
+        .bg(theme.border)
+        .into_any_element()
+}
+
+/// One button of a prompt's footer.
+fn prompt_button<F>(
+    label: &'static str,
+    primary: bool,
+    theme: &ThemeColor,
+    cx: &mut Context<MeowDown>,
+    run: F,
+) -> AnyElement
+where
+    F: Fn(&mut MeowDown, &mut Window, &mut Context<MeowDown>) + 'static,
+{
+    div()
+        .id(SharedString::from(format!("prompt-{label}")))
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(28.))
+        .px(px(14.))
+        .rounded(px(6.))
+        .text_sm()
+        .cursor_pointer()
+        .when(primary, |this| {
+            this.bg(theme.primary)
+                .text_color(theme.primary_foreground)
+                .hover(|style| style.opacity(0.88))
+        })
+        .when(!primary, |this| {
+            this.bg(theme.muted)
+                .text_color(theme.foreground)
+                .hover(|style| style.bg(theme.secondary))
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| run(this, window, cx)),
+        )
+        .child(label)
+        .into_any_element()
+}
+
+/// A name nobody has taken yet: `新建文档.md`, then `新建文档 2.md`, and so on.
+fn unused_path(dir: &Path, stem: &str, ext: Option<&str>) -> PathBuf {
+    let build = |name: &str| match ext {
+        Some(ext) => dir.join(format!("{name}.{ext}")),
+        None => dir.join(name),
+    };
+    let first = build(stem);
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..1000 {
+        let candidate = build(&format!("{stem} {n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
+/// Where a duplicate of `path` goes: `笔记 - 副本.md`, then `笔记 - 副本 2.md`.
+fn copy_path_for(path: &Path) -> PathBuf {
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name(path));
+    let ext = path
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_string());
+    let build = |suffix: &str| match &ext {
+        Some(ext) => dir.join(format!("{stem}{suffix}.{ext}")),
+        None => dir.join(format!("{stem}{suffix}")),
+    };
+    let first = build(" - 副本");
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..1000 {
+        let candidate = build(&format!(" - 副本 {n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
+/// Why `name` cannot be a file name on Windows, or `None` when it can.
+fn name_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("名字不能为空".to_string());
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|ch| "\\/:*?\"<>|".contains(*ch))
+    {
+        return Some(format!("名字里不能有 {bad}"));
+    }
+    if name == "." || name == ".." {
+        return Some("这个名字不能用".to_string());
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("名字不能以点或空格结尾".to_string());
+    }
+    None
+}
+
+/// What the properties card calls a file.
+fn describe_kind(path: &Path) -> String {
+    let Some(ext) = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+    else {
+        return "文件".to_string();
+    };
+    if is_markdown(path) {
+        format!("Markdown 文档（.{ext}）")
+    } else {
+        format!("{} 文件", ext.to_ascii_uppercase())
+    }
+}
+
+/// How much sits directly inside a folder: (files, folders).
+fn count_children(dir: &Path) -> (usize, usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut files = 0;
+    let mut folders = 0;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        if entry_flags(&entry).0 {
+            folders += 1;
+        } else {
+            files += 1;
+        }
+    }
+    (files, folders)
+}
+
+/// Width of the reading column for a window `viewport` wide, with a side panel
+/// of `sidebar` pixels taking its share.
+///
+/// The prose takes [`PAGE_WIDTH_RATIO`] of what is left and is centred in it,
+/// so the margins grow with the window exactly as the text does. On a window
+/// too narrow even for the minimum measure, the margins are what goes.
+fn reading_column(viewport: Pixels, sidebar: f32) -> Pixels {
+    let available = (viewport - px(sidebar)).max(px(PAGE_MIN_WIDTH));
+    (available * PAGE_WIDTH_RATIO)
+        .max(px(PAGE_MIN_WIDTH))
+        .min(available)
+}
+
+/// Markdown files under `root` whose path inside the folder holds `query`.
+///
+/// Matching the relative path (not just the file name) means typing a folder
+/// name lists what is in it — the usual way a search box is used here.
+/// Bounded on purpose: the box is for finding a note in the folder on screen,
+/// not for indexing a disk, so a runaway match count stops at [`SEARCH_LIMIT`].
+fn search_hits(root: &Path, query: &str) -> Vec<PathBuf> {
+    const SEARCH_LIMIT: usize = 200;
+    const MAX_DEPTH: usize = 12;
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<PathBuf> = Vec::new();
+    let mut queue: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            let (is_dir, is_file) = entry_flags(&entry);
+            if is_dir {
+                if depth < MAX_DEPTH && !skip_dir(&path) {
+                    queue.push((path, depth + 1));
+                }
+            } else if is_file
+                && is_markdown(&path)
+                && relative_label(root, &path).to_lowercase().contains(&needle)
+            {
+                hits.push(path);
+                if hits.len() >= SEARCH_LIMIT {
+                    break;
+                }
+            }
+        }
+        if hits.len() >= SEARCH_LIMIT {
+            break;
+        }
+    }
+    hits.sort_by_key(|path| relative_label(root, path).to_lowercase());
+    hits
 }
 
 /// Font size, weight and color used while a block is being edited.
@@ -4195,6 +5594,21 @@ fn display_to_source(
     }
     let index = (at as isize - delta).max(0) as usize;
     inline.source_at(index.min(inline.text.len()))
+}
+
+/// The soft shadow a picture casts on the page.
+///
+/// One wide, low-alpha shadow rather than a stack of hairlines: several layers
+/// close together read as a border, which fights the rounded corners and makes
+/// a screenshot look framed. On paper the shadow is a hint of grey; on a dark
+/// page black has to be darker still or it disappears into the background.
+fn picture_shadow(theme: &ThemeColor) -> Vec<BoxShadow> {
+    let alpha = if theme.background.l < 0.5 { 0.55 } else { 0.13 };
+    vec![
+        BoxShadow::new(px(0.), px(2.), hsla(0., 0., 0., alpha))
+            .blur_radius(px(10.))
+            .spread_radius(px(-2.)),
+    ]
 }
 
 /// The blue a link is written in, picked from how dark the page is.
@@ -4820,6 +6234,13 @@ struct Overlay {
 const CHIP_PAD: f32 = 1.5;
 /// Corner of a chip.
 const CHIP_RADIUS: f32 = 4.0;
+/// How tall a chip is, as a multiple of its text size.
+///
+/// The pill is painted *behind* the glyphs, so this number is nothing but the
+/// air above and below them. At 1.38 a chip stood taller than the letters it
+/// held and a line of prose read as a row of lozenges; 1.26 still clears a
+/// descender while sitting inside the line rather than on top of it.
+const CHIP_HEIGHT_RATIO: f32 = 1.26;
 
 /// Shape the very same string at the very same width and read the glyph offsets
 /// back out, so an overlay can be positioned over the text the element tree
@@ -4900,7 +6321,7 @@ fn overlay_geometry(
     };
 
     let line_height = size * LINE_RATIO;
-    let chip_height = size * 1.38;
+    let chip_height = size * CHIP_HEIGHT_RATIO;
     // Byte offset of the current hard line inside the whole block.
     let mut base = 0usize;
     // Visual row across the whole block, so the vertical position keeps going.
@@ -5051,8 +6472,6 @@ impl MeowDown {
 
     fn render_menubar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().colors;
-        let folder = self.file_dir().display().to_string();
-        let dirty = self.dirty;
         let auto_save = self.settings.auto_save;
         let view = cx.entity();
 
@@ -5105,9 +6524,7 @@ impl MeowDown {
                         this.open_settings(SettingsTab::General, window, cx)
                     }))
                     .item(Self::menu_action(&view, "退出", "Ctrl+W", |this, window, cx| {
-                        window.remove_window();
-                        let _ = this;
-                        let _ = cx;
+                        this.request_close(window, cx)
                     }))
                 })
         };
@@ -5313,10 +6730,7 @@ impl MeowDown {
                         &view,
                         "显示/隐藏侧边栏",
                         "Ctrl+Shift+L",
-                        |this, _window, cx| {
-                            this.sidebar_visible = !this.sidebar_visible;
-                            cx.notify();
-                        },
+                        |this, _window, cx| this.toggle_sidebar(cx),
                     ))
                     .separator()
                     .item(Self::menu_action(&view, "文件列表", "", |this, _window, cx| {
@@ -5362,27 +6776,6 @@ impl MeowDown {
             .child(format)
             .child(view_menu)
             .child(div().flex_1())
-            // The folder the file list is reading, in place of the document
-            // name: the name is already in the window title.
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .when(dirty, |this| {
-                        this.child(div().size(px(6.)).rounded_full().bg(theme.primary))
-                    })
-                    .child(
-                        div()
-                            .max_w(px(520.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(folder),
-                    ),
-            )
             .into_any_element()
     }
 
@@ -5489,34 +6882,46 @@ impl MeowDown {
     fn render_sidebar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().colors;
         let tab = self.sidebar_tab;
-        // Only the file list touches the disk, and it caches the result.
-        let files = (tab == SidebarTab::Files).then(|| self.sibling_documents());
+        // Only the file list touches the disk, and it caches the result. The
+        // cache is read by reference: copying a listing of a few thousand notes
+        // on every frame is a cost that shows up as lag between keystrokes.
+        if tab == SidebarTab::Files {
+            self.refresh_siblings();
+        }
         let tabs = self.render_topbar(_window, cx);
-
-        let (items, footer, scroll_id): (Vec<AnyElement>, AnyElement, &'static str) = match &files {
-            Some(files) => (
-                match &self.tree {
-                    Some(tree) => self.tree_items(tree, 0, &theme, cx),
-                    None => self.file_items(files, &theme, cx),
-                },
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .border_t_1()
-                    .border_color(theme.sidebar_border)
-                    .px_3()
-                    .py_3()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{} 个 Markdown 文件", files.len()))
-                    .child(match &self.root {
-                        Some(_) => "点文件夹展开 · 点文件打开",
-                        None => "点击切换文档",
-                    })
-                    .into_any_element(),
-                "files-scroll",
-            ),
+        let files = (tab == SidebarTab::Files).then(|| self.folder_files.as_slice());
+        let (items, footer, scroll_id): (Vec<AnyElement>, AnyElement, &'static str) = match files {
+            Some(files) => {
+                // A tree shows a level at a time, so the number under it can
+                // only speak for the level that was read: the root's own files.
+                let count = match &self.root {
+                    Some(_) => format!("根目录 {} 个 Markdown 文件", files.len()),
+                    None => format!("{} 个 Markdown 文件", files.len()),
+                };
+                (
+                    match &self.tree {
+                        Some(tree) => self.tree_items(tree, 0, &theme, cx),
+                        None => self.file_items(files, &theme, cx),
+                    },
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(theme.sidebar_border)
+                        .px_3()
+                        .py_3()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(count)
+                        .child(match &self.root {
+                            Some(_) => "点文件夹展开 · 点文件打开",
+                            None => "点击切换文档",
+                        })
+                        .into_any_element(),
+                    "files-scroll",
+                )
+            }
             None => {
                 let text = self.document_text();
                 let word_count = model::count_words(&text);
@@ -5670,7 +7075,7 @@ impl MeowDown {
                     None => (file_name(path), None),
                 };
                 div()
-                    .id(SharedString::from(format!("file:{}", path.display())))
+                    .id(path_id(path))
                     .flex()
                     .flex_col()
                     .w_full()
@@ -5733,11 +7138,21 @@ impl MeowDown {
         // starts with the folder's children.
         for child in &node.dirs {
             let open = self.expanded.contains(&child.path);
+            // `None` until the folder has been read, which is what a collapsed
+            // branch is: a number there would mean walking it after all.
             let count = child.file_count();
+            // A folder with nothing inside cannot be opened: it gets no
+            // chevron and a dimmed name, so an empty branch reads as empty
+            // instead of as a file that failed to load.
+            let hollow = child.shows_nothing();
             let path = child.path.clone();
+            // A folder answers the right button whether it is empty or not: the
+            // menu is where "新建文件" lives, so an empty folder is exactly the
+            // one that needs it.
+            let menu_path = child.path.clone();
             rows.push(
                 div()
-                    .id(SharedString::from(format!("dir:{}", child.path.display())))
+                    .id(path_id(&child.path))
                     .flex()
                     .items_center()
                     .gap(px(5.))
@@ -5747,16 +7162,33 @@ impl MeowDown {
                     .py(px(4.))
                     .rounded_md()
                     .text_sm()
-                    .text_color(theme.sidebar_foreground)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.sidebar_accent))
+                    .text_color(if hollow {
+                        theme.muted_foreground
+                    } else {
+                        theme.sidebar_foreground
+                    })
+                    .when(!hollow, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(theme.sidebar_accent))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    if this.expanded.remove(&path) {
+                                        cx.notify();
+                                        return;
+                                    }
+                                    this.expanded.insert(path.clone());
+                                    // Read the level being opened, now: the next
+                                    // frame draws whatever is in it.
+                                    this.sync_tree();
+                                    cx.notify();
+                                }),
+                            )
+                    })
                     .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            if !this.expanded.remove(&path) {
-                                this.expanded.insert(path.clone());
-                            }
-                            cx.notify();
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.open_menu(menu_path.clone(), true, event.position, cx);
                         }),
                     )
                     .child(
@@ -5765,7 +7197,11 @@ impl MeowDown {
                             .w(px(10.))
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(if open { "▾" } else { "▸" }),
+                            .child(match (hollow, open) {
+                                (true, _) => "",
+                                (false, true) => "▾",
+                                (false, false) => "▸",
+                            }),
                     )
                     .child(
                         div()
@@ -5782,7 +7218,7 @@ impl MeowDown {
                             .flex_shrink_0()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(count.to_string()),
+                            .children(count.filter(|count| *count > 0).map(|count| count.to_string())),
                     )
                     .into_any_element(),
             );
@@ -5805,8 +7241,9 @@ impl MeowDown {
     ) -> AnyElement {
         let is_current = self.path.as_deref() == Some(path);
         let target = path.to_path_buf();
+        let menu_target = path.to_path_buf();
         div()
-            .id(SharedString::from(format!("file:{}", path.display())))
+            .id(path_id(path))
             .flex()
             .items_center()
             .gap_2()
@@ -5830,6 +7267,12 @@ impl MeowDown {
                     this.open_from_sidebar(target.clone(), window, cx)
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.open_menu(menu_target.clone(), false, event.position, cx);
+                }),
+            )
             .child(
                 div()
                     .flex_1()
@@ -5842,7 +7285,1033 @@ impl MeowDown {
             .into_any_element()
     }
 
-    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    // ------------------------------------------------ file tree: right-click
+
+    /// Open the right-click menu for `path`, at the pointer.
+    fn open_menu(&mut self, path: PathBuf, is_dir: bool, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.menu = Some(FileMenu { path, is_dir, at });
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The menu panel. It floats over the whole window at the click, and closes
+    /// on any press outside itself.
+    /// The list of languages, hung under a fence's language field.
+    ///
+    /// It is drawn at the root rather than inside the block because a block
+    /// clips what leaves it, and a list a couple of hundred pixels tall would be
+    /// cut in half by the very code it belongs to.
+    fn render_lang_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().colors;
+        let Some(block) = self.lang_menu.as_ref().map(|menu| menu.block) else {
+            return div().into_any_element();
+        };
+        // The block may have been folded away or the document replaced while the
+        // list was up. A panel anchored to a field that is no longer drawn would
+        // still cover the window and swallow every press.
+        if self.index_of(block).is_none() {
+            self.lang_menu = None;
+            return div().into_any_element();
+        }
+        let (active, scroll, rows) = {
+            let menu = self.lang_menu.as_ref().expect("checked just above");
+            (menu.active, menu.scroll, menu.rows.clone())
+        };
+        let Some(field) = self.lang_bounds.borrow().get(&block).copied() else {
+            // Nothing has been painted yet, so there is no field to hang the
+            // list off; the next frame will have drawn one.
+            return div().into_any_element();
+        };
+
+        let shown = rows.len().clamp(1, LANG_ROWS_SHOWN);
+        let height = px(shown as f32 * LANG_ROW + 8.);
+        let viewport = window.viewport_size();
+        // Right edges line up: the panel ends where the box ends, so it reads as
+        // belonging to it.
+        let left = (field.right() - px(LANG_PANEL_WIDTH))
+            .min((viewport.width - px(LANG_PANEL_WIDTH) - px(8.)).max(px(8.)))
+            .max(px(8.));
+        let below = field.bottom() + px(6.);
+        let top = if below + height + px(8.) <= viewport.height {
+            below
+        } else {
+            // No room underneath: the list goes above the field instead of
+            // hanging off the bottom of the window.
+            (field.top() - height - px(6.)).max(px(8.))
+        };
+
+        let mut items: Vec<AnyElement> = Vec::with_capacity(rows.len().max(1));
+        if rows.is_empty() {
+            items.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(LANG_ROW))
+                    .px(px(12.))
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("没有匹配的语言")
+                    .into_any_element(),
+            );
+        }
+        for (index, choice) in rows.into_iter().enumerate() {
+            let name = choice.name.clone();
+            let token = choice.token.clone();
+            let picked = choice;
+            items.push(
+                div()
+                    .id(SharedString::from(format!("lang-row-{index}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .w_full()
+                    .h(px(LANG_ROW))
+                    .mx(px(4.))
+                    .px(px(8.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .when(index == active, |this| this.bg(theme.sidebar_accent))
+                    .hover(|style| style.bg(theme.sidebar_accent))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.foreground)
+                            .child(SharedString::from(name)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_family(mono_font())
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(token)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.choose_lang(picked.clone(), window, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .id("lang-menu")
+            .absolute()
+            .inset_0()
+            // Any press that is not on a row is a press on the page, and the
+            // list is over: a picker that survives a click elsewhere is a
+            // picker that is in the way. The field itself is the exception —
+            // the list hangs off it, and pressing it is aiming at the anchor,
+            // not dismissing the panel.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    let on_field = this
+                        .lang_bounds
+                        .borrow()
+                        .get(&block)
+                        .is_some_and(|area| {
+                            event.position.x >= area.left()
+                                && event.position.x <= area.right()
+                                && event.position.y >= area.top()
+                                && event.position.y <= area.bottom()
+                        });
+                    if !on_field {
+                        this.close_lang_menu(cx);
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| this.close_lang_menu(cx)),
+            )
+            // The wheel belongs to the list while it is up, so a couple of
+            // hundred languages can be browsed without typing a letter.
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
+                let delta = event.delta.pixel_delta(window.line_height()).y;
+                if let Some(menu) = this.lang_menu.as_mut() {
+                    let total = menu.rows.len() as f32 * LANG_ROW;
+                    let view = LANG_ROWS_SHOWN as f32 * LANG_ROW;
+                    let limit = (total - view).max(0.);
+                    menu.scroll = (menu.scroll - delta.as_f32()).clamp(0., limit);
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .id("lang-menu-panel")
+                    .absolute()
+                    .left(left)
+                    .top(top)
+                    .w(px(LANG_PANEL_WIDTH))
+                    .py(px(4.))
+                    .flex()
+                    .flex_col()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .shadow(picture_shadow(&theme))
+                    .child(
+                        div().h(px(shown as f32 * LANG_ROW)).overflow_hidden().child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                // Scrolled by hand: the rows are a slice of the
+                                // list, moved by the wheel and by the keyboard.
+                                .mt(px(-scroll))
+                                .children(items),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().colors;
+        let Some(menu) = self.menu.clone() else {
+            return div().into_any_element();
+        };
+        let target = menu.path.clone();
+        let is_dir = menu.is_dir;
+        // "新建…" writes into a folder: the folder itself, or the one the file
+        // sits in. Same for a search.
+        let dir = if is_dir {
+            target.clone()
+        } else {
+            target
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| target.clone())
+        };
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if !is_dir {
+            rows.push(menu_item("打开", &theme, cx, {
+                let path = target.clone();
+                move |this, window, cx| this.open_from_sidebar(path.clone(), window, cx)
+            }));
+            rows.push(menu_item("在新窗口中打开", &theme, cx, {
+                let path = target.clone();
+                move |this, _, cx| this.open_in_new_window(path.clone(), cx)
+            }));
+        }
+        rows.push(menu_item("新建文件", &theme, cx, {
+            let dir = dir.clone();
+            move |this, window, cx| this.new_file_in(dir.clone(), window, cx)
+        }));
+        rows.push(menu_item("新建文件夹", &theme, cx, {
+            let dir = dir.clone();
+            move |this, window, cx| this.new_folder_in(dir.clone(), window, cx)
+        }));
+        if is_dir {
+            rows.push(menu_item("搜索", &theme, cx, {
+                let dir = dir.clone();
+                move |this, window, cx| this.start_search(dir.clone(), window, cx)
+            }));
+        }
+        rows.push(menu_rule(&theme));
+        rows.push(menu_item("重命名", &theme, cx, {
+            let path = target.clone();
+            move |this, window, cx| this.start_rename(path.clone(), window, cx)
+        }));
+        if !is_dir {
+            rows.push(menu_item("创建副本", &theme, cx, {
+                let path = target.clone();
+                move |this, _, cx| this.duplicate_file(path.clone(), cx)
+            }));
+        }
+        rows.push(menu_rule(&theme));
+        rows.push(menu_item("删除", &theme, cx, {
+            let path = target.clone();
+            move |this, window, cx| this.confirm_delete(path.clone(), window, cx)
+        }));
+        rows.push(menu_item("属性", &theme, cx, {
+            let path = target.clone();
+            move |this, _, cx| this.show_properties(path.clone(), cx)
+        }));
+        rows.push(menu_rule(&theme));
+        rows.push(menu_item("复制文件路径", &theme, cx, {
+            let path = target.clone();
+            move |this, _, cx| this.copy_path(path.clone(), cx)
+        }));
+        rows.push(menu_item("打开文件位置", &theme, cx, {
+            let path = target.clone();
+            move |this, _, cx| this.reveal_file(path.clone(), cx)
+        }));
+
+        // A menu opened near the right or bottom edge would hang off the window,
+        // so it is pulled back inside instead of being cut in half.
+        let height = px(rows.len() as f32 * MENU_ROW + 8.);
+        let viewport = window.viewport_size();
+        let x = menu
+            .at
+            .x
+            .min((viewport.width - px(MENU_WIDTH) - px(8.)).max(px(8.)));
+        let y = menu
+            .at
+            .y
+            .min((viewport.height - height - px(8.)).max(px(8.)));
+
+        div()
+            .id("file-menu")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_menu(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| this.close_menu(cx)),
+            )
+            .child(
+                div()
+                    .id("file-menu-panel")
+                    .absolute()
+                    .left(x)
+                    .top(y)
+                    .w(px(MENU_WIDTH))
+                    .flex()
+                    .flex_col()
+                    .py(px(4.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    // ------------------------------------------------------ file tree: prompts
+
+    fn close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt.take().is_some() {
+            // The modal took the keyboard for its own field. Handing it back is
+            // part of closing: otherwise the page keeps looking selected while
+            // it takes no typing at all.
+            self.return_to_document(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// The question the window asks on its way out: 保存 / 丢弃 / 取消.
+    ///
+    /// It is drawn above everything else, and the dim room around it answers
+    /// "取消" — a stray click on the page was never meant as "throw it away".
+    fn render_close_prompt(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().colors;
+        let focus = self.close_focus.clone();
+        let named = self.path.as_ref().map(|path| file_name(path));
+        let (title, note) = match &named {
+            Some(name) => (
+                "保存对这份文档的修改？",
+                format!("「{name}」里还有没写回磁盘的内容，关闭之后这些修改就没了。"),
+            ),
+            None => (
+                "保存这份文档？",
+                "这份文档还没有保存到磁盘，关闭之后写下的内容就没了。".to_string(),
+            ),
+        };
+
+        div()
+            .id("close-backdrop")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 0.35,
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.cancel_close(window, cx)),
+            )
+            // The wheel stops here too, for the same reason the settings
+            // dialog stops it: the page behind must not move while a question
+            // about it is on screen.
+            .on_scroll(|_: &ScrollEvent, _: &mut Window, cx: &mut App| {
+                cx.stop_propagation();
+            })
+            .child(
+                div()
+                    .id("close-card")
+                    .track_focus(&focus)
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .w(px(392.))
+                    .p_4()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    // Clicks inside the card are not clicks on the dim room.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(note),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .w_full()
+                            .child(prompt_button("保存", true, &theme, cx, |this, window, cx| {
+                                this.save_and_close(window, cx)
+                            }))
+                            .child(prompt_button("丢弃", false, &theme, cx, |this, window, cx| {
+                                this.discard_and_close(window, cx)
+                            }))
+                            .child(prompt_button("取消", false, &theme, cx, |this, window, cx| {
+                                this.cancel_close(window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Give the keyboard back to the page after something else held it.
+    ///
+    /// A freshly created file is loaded and then renamed, and while the rename
+    /// box is up the document has no caret. Without this the box closes onto a
+    /// page that is silent: typing goes nowhere until the reader clicks a line.
+    fn return_to_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let index = self
+            .active_id
+            .and_then(|id| self.index_of(id))
+            .unwrap_or(0);
+        self.focus_block(index, window, cx);
+    }
+
+    /// The modal a file-tree command opened: a name to type, a delete to
+    /// confirm, a search, or the properties card.
+    fn render_prompt(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().colors;
+
+        // A search walks the disk, so it is re-run when the query changes and
+        // not on every frame the window paints.
+        if let Some(prompt) = self.prompt.as_mut() {
+            if prompt.kind == PromptKind::Search {
+                let query = prompt
+                    .field
+                    .as_ref()
+                    .map(|field| field.read(cx).value().to_string())
+                    .unwrap_or_default();
+                if query != prompt.hits_query {
+                    prompt.hits = search_hits(&prompt.path, &query);
+                    prompt.hits_query = query;
+                }
+            }
+        }
+
+        let Some(prompt) = self.prompt.as_ref() else {
+            return div().into_any_element();
+        };
+        let kind = prompt.kind;
+        let title = prompt.title.clone();
+        let path = prompt.path.clone();
+        let note = prompt.note.clone();
+        let rows_data = prompt.rows.clone();
+        let hits = prompt.hits.clone();
+        let field = prompt.field.clone();
+        let width = if matches!(kind, PromptKind::Properties | PromptKind::Search) {
+            460.
+        } else {
+            400.
+        };
+
+        let mut body: Vec<AnyElement> = Vec::new();
+        body.push(
+            div()
+                .text_base()
+                .font_weight(FontWeight::MEDIUM)
+                .child(title)
+                .into_any_element(),
+        );
+        body.push(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(path.display().to_string())
+                .into_any_element(),
+        );
+        if let Some(field) = &field {
+            body.push(
+                div()
+                    .w_full()
+                    .px_2()
+                    .py(px(5.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .child(
+                        Textarea::new(field)
+                            .appearance(false)
+                            .bordered(false)
+                            .w_full()
+                            .p_0()
+                            .text_size(px(13.))
+                            .text_color(theme.foreground),
+                    )
+                    .into_any_element(),
+            );
+        }
+        for (label, value) in &rows_data {
+            body.push(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .w_full()
+                    .text_sm()
+                    .child(
+                        div()
+                            .w(px(76.))
+                            .flex_shrink_0()
+                            .text_color(theme.muted_foreground)
+                            .child(label.clone()),
+                    )
+                    .child(div().flex_1().min_w_0().child(value.clone()))
+                    .into_any_element(),
+            );
+        }
+        if kind == PromptKind::Search {
+            let mut list = div()
+                .id("search-hits")
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .w_full()
+                .max_h(px(260.))
+                .overflow_y_scroll();
+            if hits.is_empty() {
+                let empty = if path.display().to_string().is_empty() {
+                    "输入关键字"
+                } else {
+                    "这个文件夹里没有匹配的文件"
+                };
+                list = list.child(
+                    div()
+                        .px_2()
+                        .py_2()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(empty),
+                );
+            }
+            for hit in &hits {
+                let target = hit.clone();
+                let label = relative_label(&path, hit);
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("hit:{}", hit.display())))
+                        .flex()
+                        .items_center()
+                        .w_full()
+                        .px_2()
+                        .py(px(4.))
+                        .rounded(px(5.))
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.sidebar_accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.prompt = None;
+                                this.load_from_path(target.clone(), window, cx);
+                                cx.notify();
+                            }),
+                        )
+                        .child(label),
+                );
+            }
+            body.push(list.into_any_element());
+        }
+        if !note.is_empty() {
+            body.push(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(note)
+                    .into_any_element(),
+            );
+        }
+
+        let mut buttons: Vec<AnyElement> = Vec::new();
+        match kind {
+            PromptKind::Properties => {
+                buttons.push(prompt_button("关闭", false, &theme, cx, |this, window, cx| {
+                    this.close_prompt(window, cx)
+                }));
+            }
+            PromptKind::Delete => {
+                buttons.push(prompt_button("取消", false, &theme, cx, |this, window, cx| {
+                    this.close_prompt(window, cx)
+                }));
+                buttons.push(prompt_button("删除", true, &theme, cx, |this, window, cx| {
+                    this.commit_prompt(window, cx)
+                }));
+            }
+            PromptKind::Search => {
+                buttons.push(prompt_button("关闭", false, &theme, cx, |this, window, cx| {
+                    this.close_prompt(window, cx)
+                }));
+            }
+            PromptKind::Rename => {
+                buttons.push(prompt_button("取消", false, &theme, cx, |this, window, cx| {
+                    this.close_prompt(window, cx)
+                }));
+                buttons.push(prompt_button("确定", true, &theme, cx, |this, window, cx| {
+                    this.commit_prompt(window, cx)
+                }));
+            }
+        }
+
+        div()
+            .id("prompt-backdrop")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Hsla {
+                h: 0.0,
+                s: 0.0,
+                l: 0.0,
+                a: 0.35,
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.close_prompt(window, cx)),
+            )
+            .child(
+                div()
+                    .id("prompt-card")
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .w(px(width))
+                    .p_4()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    // Clicks inside the card are not clicks on the backdrop.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                    )
+                    .children(body)
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .w_full()
+                            .children(buttons),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Do whatever the open prompt asked for. Enter and the primary button both
+    /// land here, so the keyboard and the mouse cannot drift apart.
+    fn commit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
+        match prompt.kind {
+            PromptKind::Rename => self.apply_rename(prompt, cx),
+            PromptKind::Delete => self.apply_delete(prompt, window, cx),
+            PromptKind::Search => {
+                if let Some(first) = prompt.hits.first().cloned() {
+                    self.load_from_path(first, window, cx);
+                }
+            }
+            PromptKind::Properties => {}
+        }
+        // A prompt that did not go through puts itself back on screen and keeps
+        // the keyboard; one that is gone hands it to the page.
+        if self.prompt.is_none() {
+            self.return_to_document(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Rename the file or folder the prompt is holding.
+    fn apply_rename(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
+        let raw = prompt
+            .field
+            .as_ref()
+            .map(|field| field.read(cx).value().to_string())
+            .unwrap_or_default();
+        let name = raw.trim().to_string();
+        if let Some(problem) = name_problem(&name) {
+            self.reopen_with_note(prompt, problem, cx);
+            return;
+        }
+        let parent = prompt
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let target = parent.join(&name);
+        if target == prompt.path {
+            self.hint = "名字没有变".into();
+            return;
+        }
+        if target.exists() {
+            self.reopen_with_note(prompt, "这个名字已经有人用了".to_string(), cx);
+            return;
+        }
+        match std::fs::rename(&prompt.path, &target) {
+            Ok(()) => {
+                // The document on screen may be the one that just moved.
+                if self.path.as_deref() == Some(prompt.path.as_path()) {
+                    self.path = Some(target.clone());
+                }
+                // So may the folder the panel is listing.
+                if let Some(root) = self.root.clone() {
+                    if root == prompt.path {
+                        self.root = Some(target.clone());
+                    }
+                }
+                self.refresh_folder(cx);
+                self.hint = format!("已重命名为 {}", file_name(&target)).into();
+            }
+            Err(err) => self.reopen_with_note(prompt, format!("重命名失败：{err}"), cx),
+        }
+    }
+
+    /// Put the prompt back on screen with the reason it did not go through.
+    fn reopen_with_note(&mut self, mut prompt: Prompt, note: String, cx: &mut Context<Self>) {
+        prompt.note = note.into();
+        self.prompt = Some(prompt);
+        cx.notify();
+    }
+
+    /// Send the file or folder to the Recycle Bin, once the user has said so.
+    fn apply_delete(&mut self, prompt: Prompt, window: &mut Window, cx: &mut Context<Self>) {
+        match shellops::recycle(&prompt.path) {
+            Ok(()) => {
+                let open_document = self
+                    .path
+                    .as_ref()
+                    .is_some_and(|open| open.starts_with(&prompt.path));
+                let opened_folder = self
+                    .root
+                    .as_ref()
+                    .is_some_and(|root| root.starts_with(&prompt.path));
+                if opened_folder {
+                    self.root = None;
+                }
+                if open_document {
+                    // The file is gone: forget the path first, or the blank
+                    // document that replaces it would be written straight back
+                    // into the folder that no longer has it.
+                    self.path = None;
+                    self.dirty = false;
+                }
+                self.refresh_folder(cx);
+                if open_document {
+                    self.new_document(window, cx);
+                }
+                self.hint = format!("已删除 {}（可从回收站找回）", file_name(&prompt.path)).into();
+            }
+            Err(err) => self.hint = format!("删除失败：{err}").into(),
+        }
+    }
+
+    fn start_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let name = file_name(&path);
+        let field = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 1)
+                .submit_on_enter(false)
+        });
+        field.update(cx, |field, cx| field.set_value(name, window, cx));
+        self.take_keyboard(field.clone(), window, cx);
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Rename,
+            path,
+            title: "重命名".into(),
+            field: Some(field),
+            note: "".into(),
+            hits: Vec::new(),
+            hits_query: String::new(),
+            rows: Vec::new(),
+        });
+        cx.notify();
+    }
+
+    fn start_search(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let field = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 1)
+                .submit_on_enter(false)
+                .placeholder("文件名关键字")
+        });
+        self.take_keyboard(field.clone(), window, cx);
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Search,
+            path: dir,
+            title: "搜索".into(),
+            field: Some(field),
+            note: "回车打开第一个结果".into(),
+            hits: Vec::new(),
+            hits_query: String::new(),
+            rows: Vec::new(),
+        });
+        cx.notify();
+    }
+
+    /// Hand the keyboard to a prompt's field once the frame that opened it has
+    /// settled.
+    ///
+    /// Focusing it on the spot is not enough. A prompt can be opened right after
+    /// a document was loaded, and loading one asks the first paragraph to take
+    /// the focus again at the end of the cycle — that trailing request arrives
+    /// after this one and quietly wins, so the box is on screen with a caret in
+    /// it while every keystroke goes into the page behind. Asking later than the
+    /// page does is what makes the box actually own the keyboard.
+    fn take_keyboard(&self, field: Entity<TextareaState>, window: &mut Window, cx: &mut Context<Self>) {
+        cx.defer_in(window, move |this, window, cx| {
+            // A prompt that has been dismissed in the meantime must not pull
+            // the focus back out of the page.
+            if this.prompt.is_some() {
+                field.update(cx, |field, cx| {
+                    field.focus(window, cx);
+                    // The suggested name is there to be replaced, the way
+                    // Explorer leaves a fresh file's name selected: typing
+                    // starts a new name instead of appending to the old one.
+                    field.select_all(window, cx);
+                });
+            }
+        });
+    }
+
+    fn confirm_delete(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
+        let name = file_name(&path);
+        let title = if path.is_dir() {
+            format!("删除文件夹「{name}」？")
+        } else {
+            format!("删除「{name}」？")
+        };
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Delete,
+            path,
+            title: title.into(),
+            field: None,
+            note: "会放进回收站，需要的话可以从那里找回来。".into(),
+            hits: Vec::new(),
+            hits_query: String::new(),
+            rows: Vec::new(),
+        });
+        cx.notify();
+    }
+
+    fn show_properties(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let is_dir = path.is_dir();
+        let mut rows: Vec<(String, String)> = Vec::new();
+        rows.push(("名称".into(), file_name(&path)));
+        rows.push((
+            "位置".into(),
+            path.parent()
+                .map(|parent| parent.display().to_string())
+                .unwrap_or_default(),
+        ));
+        rows.push((
+            "类型".into(),
+            if is_dir {
+                "文件夹".to_string()
+            } else {
+                describe_kind(&path)
+            },
+        ));
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if is_dir {
+                let (files, folders) = count_children(&path);
+                rows.push((
+                    "内容".into(),
+                    format!("{files} 个文件，{folders} 个文件夹"),
+                ));
+            } else {
+                rows.push((
+                    "大小".into(),
+                    format!(
+                        "{}（{} 字节）",
+                        shellops::format_size(meta.len()),
+                        meta.len()
+                    ),
+                ));
+            }
+            rows.push((
+                "修改时间".into(),
+                shellops::modified(&path).unwrap_or_else(|| "—".into()),
+            ));
+            rows.push((
+                "创建时间".into(),
+                shellops::created(&path).unwrap_or_else(|| "—".into()),
+            ));
+        }
+        if !is_dir {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                rows.push((
+                    "字数".into(),
+                    format!(
+                        "{} 字 · {} 字符 · {} 行",
+                        model::count_words(&text),
+                        text.chars().count(),
+                        text.lines().count()
+                    ),
+                ));
+            }
+        }
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Properties,
+            path,
+            title: "属性".into(),
+            field: None,
+            note: "".into(),
+            hits: Vec::new(),
+            hits_query: String::new(),
+            rows,
+        });
+        cx.notify();
+    }
+
+    fn copy_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+        self.hint = "已复制路径".into();
+        cx.notify();
+    }
+
+    fn reveal_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let is_dir = path.is_dir();
+        let mut command = std::process::Command::new("explorer.exe");
+        if is_dir {
+            command.arg(&path);
+        } else {
+            // `/select,` needs the path in the same argument, comma and all.
+            command.arg(format!("/select,{}", path.display()));
+        }
+        self.hint = match command.spawn() {
+            Ok(_) => "已在资源管理器中打开".into(),
+            Err(err) => format!("打开位置失败：{err}").into(),
+        };
+        cx.notify();
+    }
+
+    /// A second window on the same file, with its own caret and its own undo
+    /// history. Both windows write the same file, which is what an editor that
+    /// asks for "open in a new window" means.
+    fn open_in_new_window(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let bounds = Bounds::centered(None, size(px(1240.), px(840.)), cx);
+        let title = file_name(&path);
+        let opened = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            move |window, cx| cx.new(|cx| MeowDown::with_path(Some(path.clone()), window, cx)),
+        );
+        self.hint = match opened {
+            Ok(_) => "已在新窗口打开".into(),
+            Err(err) => format!("新窗口打开失败：{err}").into(),
+        };
+        cx.notify();
+    }
+
+    fn new_file_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let path = unused_path(&dir, "新建文档", Some("md"));
+        if let Err(err) = std::fs::write(&path, "") {
+            self.hint = format!("新建文件失败：{err}").into();
+            cx.notify();
+            return;
+        }
+        self.expanded.insert(dir);
+        self.refresh_folder(cx);
+        self.load_from_path(path.clone(), window, cx);
+        // The name it was born with is a placeholder; the caret is put in it
+        // straight away so typing replaces it, the way Explorer does it.
+        self.start_rename(path, window, cx);
+    }
+
+    fn new_folder_in(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let path = unused_path(&dir, "新建文件夹", None);
+        if let Err(err) = std::fs::create_dir(&path) {
+            self.hint = format!("新建文件夹失败：{err}").into();
+            cx.notify();
+            return;
+        }
+        self.expanded.insert(dir);
+        self.refresh_folder(cx);
+        self.start_rename(path, window, cx);
+    }
+
+    fn duplicate_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let copy = copy_path_for(&path);
+        self.hint = match std::fs::copy(&path, &copy) {
+            Ok(_) => {
+                self.refresh_folder(cx);
+                format!("已创建副本 {}", file_name(&copy)).into()
+            }
+            Err(err) => format!("创建副本失败：{err}").into(),
+        };
+        cx.notify();
+    }
+
+    /// Forget the cached listing so the next frame re-reads the folder.
+    fn refresh_folder(&mut self, cx: &mut Context<Self>) {
+        self.folder_scan_at = None;
+        self.tree = None;
+        cx.notify();
+    }
+
+    fn render_body(
+        &mut self,
+        window: &mut Window,
+        sidebar: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().colors;
 
         // A glide to a heading is advanced here: `request_animation_frame`
@@ -5915,12 +8384,12 @@ impl MeowDown {
         // It is resolved before the blocks are built so a code fence can count
         // its wrapped rows at the width it will actually get.
         //
-        // The column takes whatever the window gives it: a fixed width would
-        // leave a band of dead space on a wide screen and squeeze the text on a
-        // narrow one. The reading margin lives in the padding below, so the
-        // prose follows the window as it is resized.
-        let sidebar = if self.sidebar_visible { SIDEBAR_WIDTH } else { 0. };
-        let column = (window.viewport_size().width - px(sidebar)).max(px(320.));
+        // The column takes 95% of the content area and grows with it; the
+        // remaining 5% is split into the two margins, so the text is centred
+        // and never runs edge to edge. The width here is the text width itself
+        // — the air on either side comes from centering the column, not from
+        // padding, so a block can measure the whole span it is given.
+        let column = reading_column(window.viewport_size().width, sidebar);
 
         let ids: Vec<u64> = self.blocks.iter().map(|block| block.id).collect();
         let children: Vec<AnyElement> = ids
@@ -5929,7 +8398,25 @@ impl MeowDown {
             .collect();
 
         let scroll = self.scroll.clone();
-        let is_sample = self.path.is_none();
+        // What the line above the page says. A folder with no note picked yet
+        // gets its own wording: the sample's "直接开始编辑" would be a lie, and
+        // a blank page with no explanation reads as a bug.
+        let empty = self
+            .blocks
+            .iter()
+            .all(|block| block.text.trim().is_empty());
+        let banner: Option<&'static str> = if self.path.is_some() {
+            None
+        } else if self.sample {
+            Some("示例文档 · 直接开始编辑，Ctrl+S 保存")
+        } else if self.root.is_some() {
+            empty.then_some("未打开文档 · 从左侧选一篇，或右键新建文件")
+        } else {
+            // An unnamed page once the sample has had its one showing: the
+            // line introduces it while it is still empty, and gets out of the
+            // way the moment there is something to read.
+            empty.then_some("新文档 · 直接开始编辑，Ctrl+S 保存")
+        };
 
         // The scrollbar is an overlay sibling of the scrolling area: inside it,
         // an absolutely positioned element would scroll along with the text.
@@ -5945,22 +8432,33 @@ impl MeowDown {
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&scroll)
+                    // The page is a click target in its own right: a press on
+                    // the room around the text — the margins, the space under
+                    // the last paragraph, the whole of an empty document — puts
+                    // the caret in the nearest line instead of doing nothing.
+                    // A press that landed on a block is left alone: those run
+                    // their own handlers, and this one only runs after them.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.focus_page_at(event.position, window, cx);
+                        }),
+                    )
                     .child(
                         div()
                             .w(column)
                             .mx_auto()
-                            .px(px(28.))
                             .pt(px(34.))
                             .pb(px(180.))
                             .flex()
                             .flex_col()
-                            .when(is_sample, |this| {
+                            .when_some(banner, |this, text| {
                                 this.child(
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
                                         .pb_4()
-                                        .child("示例文档 · 直接开始编辑，Ctrl+S 保存"),
+                                        .child(text),
                                 )
                             })
                             .children(children),
@@ -6365,6 +8863,21 @@ impl MeowDown {
                     ));
                 }
             }
+            // A file that was just created holds no words, so the page would be
+            // a white sheet with a thin caret in the corner. One line of grey
+            // text marks where that caret is and what the page is for; it goes
+            // away with the first character typed.
+            if text.is_empty() && self.blocks.len() == 1 {
+                field = field.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(TEXT_INSET)
+                        .text_color(theme.muted_foreground)
+                        .opacity(0.6)
+                        .child(EMPTY_PAGE_HINT),
+                );
+            }
             content = content.child(field);
         } else {
             let inline = inline::render(&text);
@@ -6481,6 +8994,21 @@ impl MeowDown {
                 );
             }
             layer = layer.child(styled);
+            // The same hint for the resting page: the block can be empty and
+            // out of focus — behind the colour picker, or right after the page
+            // lost the caret to a dialog — and the page must still look like
+            // something that takes typing.
+            if text.is_empty() && self.blocks.len() == 1 {
+                layer = layer.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .text_color(theme.muted_foreground)
+                        .opacity(0.6)
+                        .child(EMPTY_PAGE_HINT),
+                );
+            }
             for (index, (rect, url)) in hits.into_iter().enumerate() {
                 layer = layer.child(link_hit(
                     cx,
@@ -6526,7 +9054,12 @@ impl MeowDown {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.activate_at(id, event.position, window, cx)
+                    this.activate_at(id, event.position, window, cx);
+                    // The page behind the blocks has a handler of its own, for
+                    // the empty room around them. A press that landed on a line
+                    // is already resolved; letting it through would move the
+                    // caret a second time, to the end of the paragraph.
+                    cx.stop_propagation();
                 }),
             )
             .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
@@ -6561,6 +9094,9 @@ impl MeowDown {
             return div().into_any_element();
         };
         let code = self.blocks[index].state.clone();
+        // Whether the language box is the thing being typed into, which is what
+        // makes its border stand up — and what puts the list under it.
+        let focused = self.lang_focus == Some(id);
 
         // The editor is given a definite height, so the height has to match the
         // text it lays out — and it has to be the *same* every frame. Measuring
@@ -6639,6 +9175,9 @@ impl MeowDown {
             .border_color(theme.border)
             .bg(code_fill(&theme))
             .overflow_hidden()
+            // The fence stands on the page as one box, and a press anywhere in
+            // it belongs to the editor inside, never to the page behind.
+            .child(self.block_probe(id))
             // A code block shows every line it has, so there is nothing inside
             // it to scroll: the wheel belongs to the page. Left alone, the
             // editor swallows it and the page stops moving under the pointer.
@@ -6714,14 +9253,23 @@ impl MeowDown {
                     .right(px(10.))
                     .when(!is_active, |this| this.opacity(0.0))
                     .child(
+                        // The box is a select as much as a field, so it is drawn
+                        // like one: a border, so it reads as something to click
+                        // rather than as a label lying over the code, and a
+                        // brighter one while it holds the keyboard.
                         div()
-                            .w(px(96.))
-                            .px(px(4.))
-                            .rounded(px(3.))
+                            .relative()
+                            .w(px(104.))
+                            .px(px(5.))
+                            .py(px(1.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(if focused { theme.primary } else { theme.border })
                             .bg(Hsla {
-                                a: 0.9,
+                                a: 0.94,
                                 ..theme.background
                             })
+                            .child(self.lang_probe(id))
                             .child(
                                 Textarea::new(&lang)
                                     .appearance(false)
@@ -6773,19 +9321,25 @@ impl MeowDown {
                 .into_any_element()
         };
 
-        let media: AnyElement = if uploading {
-            placeholder("正在上传图片…")
+        // Whether a picture is really drawn, or a placeholder stands in for it.
+        // Only a picture gets a shadow and a double click; a placeholder keeps
+        // the full width of the column, the way a media slot reads.
+        let (media, is_picture): (AnyElement, bool) = if uploading {
+            (placeholder("正在上传图片…"), false)
         } else if src.trim().is_empty() {
-            placeholder("图片路径为空")
+            (placeholder("图片路径为空"), false)
         } else if is_remote(&src) {
             match self.remote_image(&src, cx) {
-                RemoteState::Ready(image) => img(image)
-                    .max_w_full()
-                    .max_h(px(460.))
-                    .rounded_md()
-                    .into_any_element(),
-                RemoteState::Pending => placeholder("正在下载图片…"),
-                RemoteState::Failed => placeholder("图片下载失败，检查链接是否可访问"),
+                RemoteState::Ready(image) => (
+                    img(image)
+                        .max_w_full()
+                        .max_h(px(460.))
+                        .rounded_md()
+                        .into_any_element(),
+                    true,
+                ),
+                RemoteState::Pending => (placeholder("正在加载图片…"), false),
+                RemoteState::Failed => (placeholder("图片下载失败，检查链接是否可访问"), false),
             }
         } else {
             let alt_for_fallback = alt.clone();
@@ -6793,32 +9347,35 @@ impl MeowDown {
                 Some(path) => img(path),
                 None => img(SharedString::from(src.clone())),
             };
-            element
-                .max_w_full()
-                .max_h(px(460.))
-                .rounded_md()
-                .with_fallback(move || {
-                    div()
-                        .flex()
-                        .items_center()
-                        .w_full()
-                        .min_h(px(64.))
-                        .rounded_md()
-                        .border_1()
-                        .border_dashed()
-                        .border_color(theme.border)
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(if alt_for_fallback.is_empty() {
-                            SharedString::from("图片加载失败")
-                        } else {
-                            SharedString::from(format!("图片加载失败：{}", alt_for_fallback))
-                        })
-                        .into_any_element()
-                })
-                .into_any_element()
+            (
+                element
+                    .max_w_full()
+                    .max_h(px(460.))
+                    .rounded_md()
+                    .with_fallback(move || {
+                        div()
+                            .flex()
+                            .items_center()
+                            .w_full()
+                            .min_h(px(64.))
+                            .rounded_md()
+                            .border_1()
+                            .border_dashed()
+                            .border_color(theme.border)
+                            .px_3()
+                            .py_2()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(if alt_for_fallback.is_empty() {
+                                SharedString::from("图片加载失败")
+                            } else {
+                                SharedString::from(format!("图片加载失败：{}", alt_for_fallback))
+                            })
+                            .into_any_element()
+                    })
+                    .into_any_element(),
+                true,
+            )
         };
 
         // The picture stays visible while the block is focused: the Markdown
@@ -6847,7 +9404,7 @@ impl MeowDown {
                             .child(if uploading {
                                 "正在上传，完成后自动替换为图床地址"
                             } else {
-                                "图片与源码 · 改完路径按 Esc 预览"
+                                "图片与源码 · 双击图片看大图 · Esc 预览"
                             }),
                     )
                     .child(
@@ -6863,23 +9420,362 @@ impl MeowDown {
             );
         }
 
-        column = column.child(media);
+        // Pictures sit in the middle of the column, whatever their width.
+        // Left to the column's own cross-axis alignment a narrow picture would
+        // hug the left edge while a wide one filled the whole measure, so two
+        // pictures on the same page did not line up with each other. The frame
+        // around the picture shrinks to the picture itself, which keeps the
+        // press area honest: double-clicking the room beside a narrow picture
+        // is not double-clicking the picture.
+        // A picture is wrapped in a frame that carries its shadow and answers
+        // for its double click. The frame is exactly the picture's box, so the
+        // shadow follows the picture's corners and the room beside a narrow
+        // picture stays what it looks like: page, not picture.
+        let picture: AnyElement = if is_picture {
+            div()
+                .id(SharedString::from(format!("picture-{id}")))
+                .rounded_md()
+                .shadow(picture_shadow(&theme))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        if event.click_count >= 2 {
+                            this.picture_press = None;
+                            if this.open_viewer(id, cx) {
+                                cx.stop_propagation();
+                                return;
+                            }
+                        } else {
+                            // The press that may be the first half of a double
+                            // click, and the one that opens the block for
+                            // editing.
+                            this.note_picture_press(id);
+                        }
+                        if this.active_id != Some(id) {
+                            if let Some(index) = this.index_of(id) {
+                                this.focus_block(index, window, cx);
+                            }
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(media)
+                .into_any_element()
+        } else {
+            media
+        };
+
+        column = column.child(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(picture),
+        );
 
         if !is_active && !alt.is_empty() {
             column = column.child(
                 div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(SharedString::from(alt)),
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(alt)),
+                    ),
             );
         }
 
         column
+            .relative()
+            .child(self.block_probe(id))
             .id(SharedString::from(format!("image-{id}")))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, window, cx| this.activate(id, window, cx)),
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    // One press opens the block for editing — that is how the
+                    // Markdown behind a picture is reached, and it has to stay
+                    // on the same click it always was. The second press of a
+                    // double click lands on the source row the first one just
+                    // revealed, so it arrives here rather than at the picture;
+                    // the remembered press is what tells it apart from typing.
+                    let browsing = event.click_count >= 2
+                        && this.picture_double_clicked(id)
+                        && this.open_viewer(id, cx);
+                    if !browsing && this.active_id != Some(id) {
+                        if let Some(index) = this.index_of(id) {
+                            this.focus_block(index, window, cx);
+                        }
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// The picture, full window, with its own controls.
+    ///
+    /// This is deliberately its own layer rather than a dialog: a viewer is
+    /// something to move around in, so the wheel, the drag and the arrows all
+    /// belong to it while it is up, and the document is not reachable behind.
+    fn render_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(viewer) = self.viewer.as_ref() else {
+            return div().into_any_element();
+        };
+        let viewport = window.viewport_size();
+        let count = viewer.items.len();
+        let at = viewer.at;
+        let zoom = viewer.zoom;
+        let offset = viewer.offset;
+        let src = viewer.items[at].src.clone();
+        let alt = viewer.items[at].alt.clone();
+
+        // The layer is dark on purpose, whatever the app theme is: a picture is
+        // judged against neutral black, and a light backdrop turns every dark
+        // screenshot into a grey one.
+        let shell = Hsla { h: 0.0, s: 0.0, l: 0.07, a: 1.0 };
+        let ink = Hsla { h: 0.0, s: 0.0, l: 1.0, a: 0.92 };
+        let dim = Hsla { h: 0.0, s: 0.0, l: 1.0, a: 0.6 };
+        let faint = Hsla { h: 0.0, s: 0.0, l: 1.0, a: 0.4 };
+        let pad = Hsla { h: 0.0, s: 0.0, l: 1.0, a: 0.1 };
+
+        let message = |text: &'static str| -> AnyElement {
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(dim)
+                .child(text)
+                .into_any_element()
+        };
+
+        let media: AnyElement = if is_remote(&src) {
+            match self.remote_image(&src, cx) {
+                RemoteState::Ready(image) => img(image)
+                    .object_fit(ObjectFit::Contain)
+                    .size_full()
+                    .into_any_element(),
+                RemoteState::Pending => message("正在加载图片…"),
+                RemoteState::Failed => message("图片下载失败，检查链接是否可访问"),
+            }
+        } else {
+            let element = match self.resolve_image(&src) {
+                Some(path) => img(path),
+                None => img(SharedString::from(src.clone())),
+            };
+            element
+                .object_fit(ObjectFit::Contain)
+                .size_full()
+                .with_fallback(move || {
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(dim)
+                        .child("图片加载失败")
+                        .into_any_element()
+                })
+                .into_any_element()
+        };
+
+        // Where the picture is drawn. With its intrinsic size known the frame
+        // is exactly the picture, which is what lets a click on the surrounding
+        // room be told from a click on the picture. Without it the frame falls
+        // back to the whole window and `object_fit` does the fitting.
+        let picture = match self.image_size(&src) {
+            Some(image) => {
+                let area = viewer_bounds(image, viewport, zoom, offset);
+                div()
+                    .absolute()
+                    .left(area.left())
+                    .top(area.top())
+                    .w(area.size.width)
+                    .h(area.size.height)
+                    .child(media)
+                    .into_any_element()
+            }
+            None => div()
+                .absolute()
+                .inset_0()
+                .p(px(VIEWER_PAD))
+                .child(media)
+                .into_any_element(),
+        };
+
+        let nav = |label: &'static str, side: bool| -> AnyElement {
+            let step: i32 = if side { -1 } else { 1 };
+            div()
+                .id(SharedString::from(if side { "viewer-prev" } else { "viewer-next" }))
+                .absolute()
+                .top(px(0.))
+                .h_full()
+                .w(px(64.))
+                .when(side, |this| this.left(px(0.)))
+                .when(!side, |this| this.right(px(0.)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_size(px(30.))
+                .text_color(dim)
+                .hover(|style| style.text_color(ink))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.viewer_step(step, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(label)
+                .into_any_element()
+        };
+
+        let percent = (zoom * 100.0).round() as i32;
+
+        div()
+            .id("viewer")
+            .absolute()
+            .inset_0()
+            .bg(shell)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    if let Some(viewer) = this.viewer.as_mut() {
+                        viewer.drag = Some(ViewerDrag {
+                            from: event.position,
+                            origin: viewer.offset,
+                            moved: 0.0,
+                        });
+                    }
+                    cx.notify();
+                    // The document is still laid out underneath, and a press
+                    // that reached it would open the picture a second time —
+                    // which resets the zoom the drag was about to move.
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if event.pressed_button != Some(MouseButton::Left) {
+                    return;
+                }
+                let Some(viewer) = this.viewer.as_mut() else {
+                    return;
+                };
+                let Some(drag) = viewer.drag.as_mut() else {
+                    return;
+                };
+                let dx = event.position.x - drag.from.x;
+                let dy = event.position.y - drag.from.y;
+                let travel = (dx.as_f32().powi(2) + dy.as_f32().powi(2)).sqrt();
+                drag.moved = drag.moved.max(travel);
+                viewer.offset = point(drag.origin.x + dx, drag.origin.y + dy);
+                cx.notify();
+                cx.stop_propagation();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    let Some(viewer) = this.viewer.as_mut() else {
+                        return;
+                    };
+                    let Some(drag) = viewer.drag.take() else {
+                        return;
+                    };
+                    if drag.moved < VIEWER_CLICK_SLOP {
+                        this.viewer_backdrop_clicked(event.position, window.viewport_size(), cx);
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }),
+            )
+            // The wheel is the zoom, and it stops here: the page behind must not
+            // scroll while a picture is being looked at.
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
+                let delta = event.delta.pixel_delta(window.line_height()).y;
+                if delta.is_zero() {
+                    return;
+                }
+                let factor = (1.0 + delta.as_f32() / 600.0).clamp(0.5, 2.0);
+                this.viewer_zoom(factor, event.position, window.viewport_size(), cx);
+                cx.stop_propagation();
+            }))
+            .child(picture)
+            .when(count > 1, |this| this.child(nav("‹", true)).child(nav("›", false)))
+            .child(
+                div()
+                    .id("viewer-close")
+                    .absolute()
+                    .top(px(12.))
+                    .right(px(14.))
+                    .size(px(34.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_size(px(15.))
+                    .text_color(dim)
+                    .bg(pad)
+                    .hover(|style| style.text_color(ink))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.close_viewer(cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child("✕"),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(14.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        // The caption sits on a dark plate: a bright picture
+                        // reaches the bottom of the window, and white text on
+                        // white bands is no text at all.
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(2.))
+                            .px(px(14.))
+                            .py(px(6.))
+                            .rounded_md()
+                            .bg(Hsla { h: 0.0, s: 0.0, l: 0.0, a: 0.55 })
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(ink)
+                                    .child(SharedString::from(format!("{at} / {count} · {percent}%", at = at + 1))),
+                            )
+                            .when(!alt.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(dim)
+                                        .child(SharedString::from(alt.clone())),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(faint)
+                                    .child("滚轮缩放 · 拖动平移 · ← → 切换 · 0 复位 · Esc 关闭"),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -6954,11 +9850,16 @@ impl MeowDown {
         );
 
         column
+            .relative()
+            .child(self.block_probe(id))
             .id(SharedString::from(format!("math-{id}")))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, window, cx| this.activate(id, window, cx)),
+                cx.listener(move |this, _, window, cx| {
+                    this.activate(id, window, cx);
+                    cx.stop_propagation();
+                }),
             )
             .into_any_element()
     }
@@ -6981,6 +9882,10 @@ impl MeowDown {
             .w_full()
             .px(px(BLOCK_PAD_X))
             .py(px(6.))
+            // A table opens a cell of its own on a press; the page behind it
+            // must not treat the same press as a click on the text around it.
+            .relative()
+            .child(self.block_probe(id))
             .child(self.render_table_grid(id, &source, &theme, cx))
             .into_any_element()
     }
@@ -7406,6 +10311,15 @@ impl MeowDown {
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.close_settings(window, cx)),
             )
+            // The wheel stops at the dialog as well. A press on the dim room
+            // already closes the dialog instead of reaching the page; without
+            // the same guard for the wheel, rolling it while reading a setting
+            // walks the document behind, and closing the dialog leaves the
+            // reader somewhere else entirely. Lists *inside* the dialog still
+            // scroll: they sit deeper in the tree, so they see the wheel first.
+            .on_scroll(|_: &ScrollEvent, _: &mut Window, cx: &mut App| {
+                cx.stop_propagation();
+            })
             .child(
                 div()
                     .id("settings-panel")
@@ -7541,7 +10455,7 @@ impl MeowDown {
                           hint: &'static str,
                           checked: bool,
                           id: &'static str,
-                          apply: fn(&mut MeowDown, bool)|
+                          apply: fn(&mut MeowDown, bool, &mut Context<MeowDown>)|
          -> AnyElement {
             let view = view.clone();
             setting_row(
@@ -7552,7 +10466,7 @@ impl MeowDown {
                     .on_click(move |value, _window, cx: &mut App| {
                         let value = *value;
                         view.update(cx, |this, cx| {
-                            apply(this, value);
+                            apply(this, value, cx);
                             cx.notify();
                         });
                     })
@@ -7737,6 +10651,30 @@ impl MeowDown {
             )
             .into_any_element();
 
+        // The sample shows itself once and then never again, so there has to
+        // be a door back to it: a reader who closed it before reading the
+        // shortcut list would otherwise have no way of finding it.
+        let sample_control = div()
+            .flex()
+            .items_center()
+            .child(
+                Button::new("open-sample")
+                    .small()
+                    .ghost()
+                    .label("查看示例文档")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if !this.settle_before_switch(window, cx) {
+                            return;
+                        }
+                        this.set_document(SAMPLE, None, window, cx);
+                        this.sample = true;
+                        this.close_settings(window, cx);
+                        this.hint = "示例文档 · 直接开始编辑，Ctrl+S 保存".into();
+                        cx.notify();
+                    })),
+            )
+            .into_any_element();
+
         let mut column = div().flex().flex_col().gap_5().w_full();
 
         column = column.child(setting_group(
@@ -7749,14 +10687,14 @@ impl MeowDown {
                     "Ctrl+Shift+L 也可以切换",
                     self.sidebar_visible,
                     "switch-sidebar",
-                    |this, value| this.sidebar_visible = value,
+                    |this, value, cx| this.set_sidebar_open(value, cx),
                 ),
                 switch_row(
                     "专注模式",
                     "只突出当前正在编辑的段落（F8）",
                     self.focus_mode,
                     "switch-focus",
-                    |this, value| this.focus_mode = value,
+                    |this, value, _| this.focus_mode = value,
                 ),
             ],
         ));
@@ -7789,12 +10727,20 @@ impl MeowDown {
         column = column.child(setting_group(
             "系统集成",
             &theme,
-            vec![setting_field(
-                "文件关联",
-                "让双击 .md 文件时用 MeowDown 打开",
-                assoc_control,
-                &theme,
-            )],
+            vec![
+                setting_field(
+                    "文件关联",
+                    "让双击 .md 文件时用 MeowDown 打开",
+                    assoc_control,
+                    &theme,
+                ),
+                setting_field(
+                    "示例文档",
+                    "第一次打开程序时自动显示一次，之后可以在这里再看",
+                    sample_control,
+                    &theme,
+                ),
+            ],
         ));
 
         column.into_any_element()
@@ -8303,14 +11249,69 @@ fn render_shortcut_table(cx: &App) -> AnyElement {
 impl Render for MeowDown {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().colors;
-        let sidebar = if self.sidebar_visible {
-            Some(self.render_sidebar(window, cx))
+        // The title bar's ✕ belongs to the platform, which knows nothing about
+        // unsaved work. The hook is installed on the first frame — the first
+        // moment this view has a handle of its own — and answers for the
+        // window: an empty page goes quietly, anything typed into holds it
+        // back so the question can be put on screen.
+        if !self.close_hooked {
+            self.close_hooked = true;
+            let view = cx.entity();
+            window.on_window_should_close(cx, move |window, cx| {
+                view.update(cx, |this, cx| this.before_close(window, cx))
+            });
+        }
+        // The panel's width is resolved first: the fold is advanced here, so
+        // the panel and the text beside it are laid out at the same width in
+        // the same frame, and the text widens as the panel gives way.
+        let sidebar_width = self.sidebar_width(window);
+        let sidebar = if sidebar_width > 0.5 {
+            // The panel is built at its full width and the box around it is
+            // what narrows: the lists inside keep their layout and are simply
+            // clipped by the edge, which reads as the panel sliding away
+            // instead of its contents squeezing into a sliver.
+            Some(
+                div()
+                    .w(px(sidebar_width))
+                    .h_full()
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .border_r_1()
+                    .border_color(theme.sidebar_border)
+                    .child(self.render_sidebar(window, cx))
+                    .into_any_element(),
+            )
         } else {
             None
         };
-        let body = self.render_body(window, cx);
+        let body = self.render_body(window, sidebar_width, cx);
         let settings = if self.show_settings {
             Some(self.render_settings(window, cx))
+        } else {
+            None
+        };
+        let menu = if self.menu.is_some() {
+            Some(self.render_menu(window, cx))
+        } else {
+            None
+        };
+        let prompt = if self.prompt.is_some() {
+            Some(self.render_prompt(window, cx))
+        } else {
+            None
+        };
+        let lang_menu = if self.lang_menu.is_some() {
+            Some(self.render_lang_menu(window, cx))
+        } else {
+            None
+        };
+        let viewer = if self.viewer.is_some() {
+            Some(self.render_viewer(window, cx))
+        } else {
+            None
+        };
+        let close_prompt = if self.close_prompt {
+            Some(self.render_close_prompt(cx))
         } else {
             None
         };
@@ -8334,6 +11335,8 @@ impl Render for MeowDown {
             .capture_action(cx.listener(Self::on_redo))
             .capture_action(cx.listener(Self::on_move_up))
             .capture_action(cx.listener(Self::on_move_down))
+            .capture_action(cx.listener(Self::on_move_left))
+            .capture_action(cx.listener(Self::on_move_right))
             .child(self.render_menubar(window, cx))
             .child(
                 div()
@@ -8345,6 +11348,11 @@ impl Render for MeowDown {
             )
             .child(self.render_status(window, cx))
             .children(settings)
+            .children(menu)
+            .children(lang_menu)
+            .children(prompt)
+            .children(viewer)
+            .children(close_prompt)
     }
 }
 
@@ -8353,9 +11361,11 @@ mod tests {
     // Imported by name on purpose: a glob would also pull GPUI's `#[test]`
     // attribute macro into scope and it does not apply here.
     use super::{
-        chip_content, chip_parts, file_name, is_markdown, line_runs, markdown_files,
-        markdown_files_deep, mono_font, px, relative_label, resolve_address, strip_marks,
-        ScrollAnim,
+        chip_content, chip_parts, copy_path_for, file_name, folder_tree, is_markdown, lang_matches,
+        line_runs, markdown_files, mono_font, name_problem, point, px,
+        reading_column, relative_label, resolve_address, search_hits, size, strip_marks, unused_path,
+        viewer_bounds, viewer_fit, wrapped_index, zoomed_offset, ScrollAnim, Slide, PAGE_MIN_WIDTH,
+        PAGE_WIDTH_RATIO, SIDEBAR_SLIDE, SIDEBAR_WIDTH, VIEWER_PAD,
     };
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -8483,8 +11493,11 @@ mod tests {
         assert!(!is_markdown(Path::new("a")));
     }
 
+    /// Opening a folder reads its top level and nothing below it: a subfolder
+    /// is read when it is opened, which is what keeps a crowded parent folder
+    /// from being walked in full before the first frame.
     #[test]
-    fn deep_folder_listing_walks_into_subfolders() {
+    fn the_tree_reads_one_level_at_a_time() {
         let dir = std::env::temp_dir().join(format!("meowdown-deep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("notes/2026")).unwrap();
@@ -8497,16 +11510,209 @@ mod tests {
         std::fs::write(dir.join("node_modules/pkg/y.md"), "# vendor").unwrap();
         std::fs::write(dir.join("notes/skip.txt"), "no").unwrap();
 
-        let files = markdown_files_deep(&dir);
-        let labels: Vec<String> = files
+        let mut tree = folder_tree(&dir);
+        // The root is read: its own Markdown, and a row per folder worth
+        // opening. Dot-folders and build output stay out.
+        assert_eq!(tree.file_count(), Some(1));
+        let names: Vec<&str> = tree.dirs.iter().map(|child| child.name.as_str()).collect();
+        assert_eq!(names, vec!["notes"]);
+        // The folder row is a stub: nothing below the root has been read, so it
+        // can neither be counted nor called empty.
+        assert_eq!(tree.dirs[0].file_count(), None);
+        assert!(!tree.dirs[0].shows_nothing());
+
+        // Opening `notes` — and, on the way, `notes/2026` — reads those levels.
+        tree.load_path(&dir.join("notes/2026"));
+        assert_eq!(tree.dirs[0].file_count(), Some(1));
+        let inner: Vec<&str> = tree.dirs[0]
+            .dirs
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert_eq!(inner, vec!["2026"]);
+        assert_eq!(tree.dirs[0].dirs[0].file_count(), Some(1));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A folder the user made should be in the tree even when it holds nothing
+    /// this panel can open: an empty branch that vanished reads as a bug, and
+    /// so does an `img/` full of screenshots.
+    #[test]
+    fn the_tree_keeps_folders_that_hold_no_markdown() {
+        let dir = std::env::temp_dir().join(format!("meowdown-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::create_dir_all(dir.join("img/deep")).unwrap();
+        std::fs::create_dir_all(dir.join("notes/2026")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("root.md"), "# root").unwrap();
+        std::fs::write(dir.join("notes/2026/一月.md"), "# 一月").unwrap();
+        std::fs::write(dir.join("img/shot.png"), "png").unwrap();
+
+        let mut tree = folder_tree(&dir);
+        let names: Vec<&str> = tree.dirs.iter().map(|child| child.name.as_str()).collect();
+        // Sorted, folders that hold nothing included, dot-folders left out.
+        assert_eq!(names, vec!["empty", "img", "notes"]);
+        assert_eq!(tree.file_count(), Some(1));
+        // Reading a folder that holds nothing shows it as empty; one that has
+        // only a subfolder keeps a way in.
+        let empty = tree.dirs.iter_mut().find(|child| child.name == "empty").unwrap();
+        empty.load();
+        assert!(empty.shows_nothing());
+        let img = tree.dirs.iter_mut().find(|child| child.name == "img").unwrap();
+        img.load();
+        assert_eq!(img.file_count(), Some(0));
+        assert!(!img.shows_nothing());
+        // `img/deep` is empty too, so it is a leaf with no way to open it.
+        img.dirs[0].load();
+        assert!(img.dirs[0].shows_nothing());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A new file or folder must not land on a name that is already there.
+    #[test]
+    fn a_new_name_steps_around_what_is_already_there() {
+        let dir = std::env::temp_dir().join(format!("meowdown-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = unused_path(&dir, "新建文档", Some("md"));
+        assert_eq!(file_name(&first), "新建文档.md");
+        std::fs::write(&first, "").unwrap();
+        assert_eq!(file_name(&unused_path(&dir, "新建文档", Some("md"))), "新建文档 2.md");
+
+        // A folder has no extension to keep.
+        let folder = unused_path(&dir, "新建文件夹", None);
+        assert_eq!(file_name(&folder), "新建文件夹");
+        std::fs::create_dir(&folder).unwrap();
+        assert_eq!(
+            file_name(&unused_path(&dir, "新建文件夹", None)),
+            "新建文件夹 2"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A duplicate says it is one, and keeps the extension where it belongs.
+    #[test]
+    fn a_copy_says_so_in_its_name() {
+        let dir = std::env::temp_dir().join(format!("meowdown-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("笔记.md");
+        std::fs::write(&path, "# 一").unwrap();
+
+        let first = copy_path_for(&path);
+        assert_eq!(file_name(&first), "笔记 - 副本.md");
+        std::fs::write(&first, "# 一").unwrap();
+        assert_eq!(file_name(&copy_path_for(&path)), "笔记 - 副本 2.md");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Windows refuses a handful of characters in a name. The prompt says which
+    /// one instead of letting `rename` fail with an opaque error.
+    #[test]
+    fn a_name_windows_would_refuse_is_refused_here() {
+        assert!(name_problem("").is_some());
+        assert!(name_problem("a/b").is_some());
+        assert!(name_problem("a:b").is_some());
+        assert!(name_problem("a?b").is_some());
+        assert!(name_problem("..").is_some());
+        assert!(name_problem("尾巴.").is_some());
+        assert!(name_problem("尾巴 ").is_some());
+        assert!(name_problem("笔记 2026-11-08.md").is_none());
+    }
+
+    /// The search box finds files by name, at any depth, and lists them by
+    /// their path inside the folder so two `笔记.md` can be told apart.
+    #[test]
+    fn a_search_finds_names_at_any_depth() {
+        let dir = std::env::temp_dir().join(format!("meowdown-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("会议")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("会议记录.md"), "# 一").unwrap();
+        std::fs::write(dir.join("会议/周会.md"), "# 二").unwrap();
+        std::fs::write(dir.join("其他.md"), "# 三").unwrap();
+        std::fs::write(dir.join(".git/会议.md"), "# 不该出现").unwrap();
+        std::fs::write(dir.join("会议/图.png"), "png").unwrap();
+
+        let labels: Vec<String> = search_hits(&dir, "会议")
             .iter()
             .map(|path| relative_label(&dir, path))
             .collect();
-        assert_eq!(
-            labels,
-            vec!["notes/2026/一月.md", "notes/notes.md", "root.md"]
-        );
+        assert_eq!(labels, vec!["会议/周会.md", "会议记录.md"]);
+        // Nothing typed, nothing found.
+        assert!(search_hits(&dir, "  ").is_empty());
+
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The reading column keeps a margin on both sides, follows the window
+    /// while it can, and stops growing once the measure is comfortable.
+    #[test]
+    fn the_reading_column_takes_95_percent_and_keeps_growing() {
+        // The column is 95% of the content area, whatever the window is; the
+        // other 5% is split evenly into the two margins.
+        let column = reading_column(px(1000.), SIDEBAR_WIDTH);
+        let available = px(1000. - SIDEBAR_WIDTH);
+        assert_eq!(column, available * PAGE_WIDTH_RATIO);
+        // The share survives the round trip through pixels.
+        assert!((column.as_f32() / available.as_f32() - PAGE_WIDTH_RATIO).abs() < 0.0005);
+        // Wider window, wider column — there is no cap to run into.
+        assert!(reading_column(px(2400.), SIDEBAR_WIDTH) > reading_column(px(1000.), SIDEBAR_WIDTH));
+        assert_eq!(
+            reading_column(px(2400.), SIDEBAR_WIDTH),
+            px(2400. - SIDEBAR_WIDTH) * PAGE_WIDTH_RATIO
+        );
+        // A panel toggled off hands its width to the text.
+        assert!(reading_column(px(1000.), 0.) > column);
+        // Narrow: the margins give way before the text does, down to a point,
+        // and past that the window is simply too small for both.
+        assert_eq!(reading_column(px(500.), 0.), px(500.) * PAGE_WIDTH_RATIO);
+        assert_eq!(reading_column(px(300.), 0.), px(PAGE_MIN_WIDTH));
+    }
+
+    #[test]
+    fn the_side_panel_folds_away_over_a_short_glide() {
+        let start = Instant::now();
+        let fold = Slide {
+            from: 1.,
+            to: 0.,
+            start,
+            duration: SIDEBAR_SLIDE,
+        };
+        // It starts where the panel is, and lands exactly folded.
+        assert_eq!(fold.value_at(start), (1., false));
+        let (end, done) = fold.value_at(start + SIDEBAR_SLIDE + Duration::from_millis(10));
+        assert_eq!(end, 0.);
+        assert!(done);
+
+        // The width it hands to the layout walks down without ever overshooting
+        // either end, so the panel cannot flash wider than it opens.
+        let mut previous = SIDEBAR_WIDTH;
+        for step in 1..=12 {
+            let at = start + Duration::from_millis(step * 16);
+            let (value, _) = fold.value_at(at);
+            let width = SIDEBAR_WIDTH * value;
+            assert!(width <= previous, "the fold must only ever narrow");
+            assert!((0. ..=SIDEBAR_WIDTH).contains(&width));
+            previous = width;
+        }
+        // Halfway through the time it is already most of the way gone — the
+        // ease-out is what makes a 190ms fold read as instant but not abrupt.
+        let (half, _) = fold.value_at(start + Duration::from_millis(95));
+        assert!(half < 0.5);
+
+        // The text beside it widens as the panel gives way: a half-folded panel
+        // leaves half its width to the column.
+        assert!(
+            reading_column(px(1000.), SIDEBAR_WIDTH / 2.)
+                > reading_column(px(1000.), SIDEBAR_WIDTH)
+        );
     }
 
     #[test]
@@ -8535,6 +11741,107 @@ mod tests {
         let (half, _) = anim.offset_at(start + Duration::from_millis(130));
         assert!(half <= px(-200.), "ease-out should pass halfway early");
         assert!(half > px(-400.));
+    }
+
+    #[test]
+    fn a_picture_is_fitted_to_the_window_and_never_blown_up() {
+        let window = size(px(1000.), px(700.));
+        // A big picture shrinks until the tighter of the two axes fits, with
+        // the padding kept clear on both sides.
+        let fit = viewer_fit(size(1200.0, 800.0), window);
+        let room_w = 1000.0 - VIEWER_PAD * 2.0;
+        let room_h = 700.0 - VIEWER_PAD * 2.0;
+        assert!((fit - (room_w / 1200.0).min(room_h / 800.0)).abs() < 1e-6);
+        assert!(fit < 1.0);
+
+        // A small picture is shown at its own size: upscaling a 64px icon to
+        // fill the window only makes it blurry.
+        assert_eq!(viewer_fit(size(64.0, 64.0), window), 1.0);
+    }
+
+    #[test]
+    fn the_picture_sits_in_the_middle_until_it_is_dragged() {
+        let window = size(px(1000.), px(700.));
+        let image = size(400.0, 300.0);
+        let centered = viewer_bounds(image, window, 1.0, point(px(0.), px(0.)));
+        assert_eq!(centered.size.width, px(400.));
+        assert_eq!(centered.size.height, px(300.));
+        assert_eq!(centered.origin.x, px(300.));
+        assert_eq!(centered.origin.y, px(200.));
+
+        // Zoom twice, and the picture is twice as big, still centred.
+        let zoomed = viewer_bounds(image, window, 2.0, point(px(0.), px(0.)));
+        assert_eq!(zoomed.size.width, px(800.));
+        assert_eq!(zoomed.origin.x, px(100.));
+
+        // A drag moves it by exactly what the pointer travelled.
+        let dragged = viewer_bounds(image, window, 1.0, point(px(40.), px(-25.)));
+        assert_eq!(dragged.origin.x, centered.origin.x + px(40.));
+        assert_eq!(dragged.origin.y, centered.origin.y - px(25.));
+    }
+
+    #[test]
+    fn zooming_keeps_the_point_under_the_pointer_still() {
+        let center = point(px(500.), px(350.));
+        // A point 100 right and 50 above the middle, with the picture centred.
+        let anchor = point(px(600.), px(300.));
+        let offset = zoomed_offset(point(px(0.), px(0.)), anchor, center, 2.0);
+        // Doubling the picture would push that point out by its own distance
+        // from the middle, so the picture moves the other way by as much.
+        assert_eq!(offset.x, px(-100.));
+        assert_eq!(offset.y, px(50.));
+
+        // Which is exactly where the point stays: its position on screen is the
+        // middle plus the offset plus the distance scaled by the zoom.
+        let after_x = center.x + offset.x + (anchor.x - center.x) * 2.0;
+        assert_eq!(after_x, anchor.x);
+    }
+
+    #[test]
+    fn the_arrows_wrap_at_both_ends() {
+        assert_eq!(wrapped_index(0, -1, 3), 2);
+        assert_eq!(wrapped_index(2, 1, 3), 0);
+        assert_eq!(wrapped_index(1, 1, 3), 2);
+        assert_eq!(wrapped_index(1, -2, 3), 2);
+        // One picture, or none: there is nowhere else to go.
+        assert_eq!(wrapped_index(0, 1, 1), 0);
+        assert_eq!(wrapped_index(0, -1, 0), 0);
+    }
+
+    #[test]
+    fn the_language_list_is_the_one_the_fences_are_coloured_with() {
+        let all = lang_matches("");
+        // The set comes from syntect, not from a hand-kept list, so it is large
+        // and holds the everyday names.
+        assert!(all.len() > 80, "expected a full syntax set, got {}", all.len());
+        for token in ["rs", "py", "js", "md", "toml", "css"] {
+            assert!(
+                all.iter().any(|choice| choice.token == token),
+                "{token} should be offered"
+            );
+        }
+        // The fallback is the absence of a language, not a language.
+        assert!(all.iter().all(|choice| choice.name != "Plain Text"));
+        // Nothing is offered twice, so no row is a duplicate of another.
+        let mut tokens: Vec<&str> = all.iter().map(|choice| choice.token.as_str()).collect();
+        tokens.sort_unstable();
+        let before = tokens.len();
+        tokens.dedup();
+        assert_eq!(before, tokens.len());
+    }
+
+    #[test]
+    fn a_typed_language_narrows_the_list() {
+        let all = lang_matches("").len();
+        let rusty = lang_matches("rus");
+        assert!(rusty.len() < all);
+        assert_eq!(rusty.first().map(|choice| choice.name.as_str()), Some("Rust"));
+
+        // A fence token is matched as readily as a display name: "rs" is what a
+        // reader types into the fence, "Rust" is what the list shows.
+        let short = lang_matches("rs");
+        assert_eq!(short.first().map(|choice| choice.token.as_str()), Some("rs"));
+        assert!(lang_matches("zzzznotalanguage").is_empty());
     }
 }
 

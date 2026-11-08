@@ -730,11 +730,15 @@ fn emphasis_boundary(chars: &[char], at: usize, width: usize) -> bool {
 /// Parse `label](url)` starting just after the `[`; returns where the label
 /// ends, the address, and the index just past the closing `)`.
 fn parse_link(chars: &[char], from: usize) -> Option<(usize, String, usize)> {
-    let label_end = find(chars, from, ']')?;
+    // Brackets nest inside a label: `[ [T; N] ](url)` is one link whose text
+    // holds a pair of its own. The label ends at the bracket that balances the
+    // opening one, not at the first `]` on the line.
+    let label_end = balanced(chars, from, '[', ']')?;
     if chars.get(label_end + 1) != Some(&'(') {
         return None;
     }
-    let url_end = find(chars, label_end + 2, ')')?;
+    // An address nests the same way: `…/Rust_(programming_language)`.
+    let url_end = balanced(chars, label_end + 2, '(', ')')?;
     let raw: String = chars[label_end + 2..url_end].iter().collect();
     // `[文字](地址 "标题")` — the optional title is not part of the address.
     let url = match raw.find(char::is_whitespace) {
@@ -742,6 +746,33 @@ fn parse_link(chars: &[char], from: usize) -> Option<(usize, String, usize)> {
         None => raw,
     };
     Some((label_end, url.trim().to_string(), url_end + 1))
+}
+
+/// Index of the bracket that balances the one just before `from`, counting the
+/// pairs nested in between.
+///
+/// A backslash hides the bracket after it, so a `\]` inside a label is a
+/// character and not the end of the label.
+fn balanced(chars: &[char], from: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut index = from;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\\' {
+            index += 2;
+            continue;
+        }
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -808,6 +839,53 @@ mod tests {
         let inline = render("[文档](https://a.b \"标题\")");
         assert_eq!(inline.links[0].1, "https://a.b");
         assert_eq!(inline.text, "文档");
+    }
+
+    /// The label of a link is prose, and prose may hold brackets of its own:
+    /// `[ [T; N] ](url)` is one link whose text is a slice type. Reading the
+    /// first `]` as the end of the label left the whole line unlinked.
+    #[test]
+    fn a_link_label_may_carry_brackets() {
+        let source = "[ [T; N] ](https://www.rustwiki.org.cn/zh-CN/std/primitive.array.html)";
+        let inline = render(source);
+        assert_eq!(inline.text, " [T; N] ");
+        assert_eq!(inline.links.len(), 1);
+        let (range, url) = &inline.links[0];
+        assert_eq!(&inline.text[range.clone()], " [T; N] ");
+        assert_eq!(url, "https://www.rustwiki.org.cn/zh-CN/std/primitive.array.html");
+        // The whole label is one link run.
+        assert_eq!(inline.spans.len(), 1);
+        assert_eq!(inline.spans[0].1, LINK);
+    }
+
+    /// A pair that never closes is not a link, and not a panic either.
+    #[test]
+    fn a_pair_that_never_closes_is_just_text() {
+        // No `)`: there is nothing to link to.
+        let inline = render("[ [T; N] ](https://a.b");
+        assert!(inline.links.is_empty());
+        // An outer bracket left open does not take the inner pair with it —
+        // the inner one closes, so it is a link of its own.
+        let inline = render("[ [T; N](https://a.b)");
+        assert_eq!(inline.links.len(), 1);
+        assert_eq!(&inline.text[inline.links[0].0.clone()], "T; N");
+    }
+
+    /// A backslash hides the bracket after it, so an escaped `]` does not end
+    /// the label.
+    #[test]
+    fn an_escaped_bracket_does_not_end_the_label() {
+        let inline = render(r"[a \] b](https://a.b)");
+        assert_eq!(inline.text, "a ] b");
+        assert_eq!(inline.links[0].1, "https://a.b");
+    }
+
+    /// Addresses hold parentheses too — Wikipedia links are full of them.
+    #[test]
+    fn an_address_may_carry_parentheses() {
+        let inline = render("[Rust](https://a.b/wiki/Rust_(language))");
+        assert_eq!(inline.links[0].1, "https://a.b/wiki/Rust_(language)");
+        assert_eq!(inline.text, "Rust");
     }
 
     #[test]

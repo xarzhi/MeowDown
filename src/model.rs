@@ -659,7 +659,7 @@ pub fn strip_inline_markup(text: &str) -> String {
     mark_links(&chars, &mut skip);
     mark_html_tags(&chars, &mut skip);
 
-    for marker in ["***", "___", "**", "__", "~~", "*", "_", "`"] {
+    for marker in ["***", "___", "**", "__", "~~", "==", "*", "_", "`"] {
         let seq: Vec<char> = marker.chars().collect();
         let mut index = 0usize;
         while index + seq.len() <= chars.len() {
@@ -723,8 +723,22 @@ fn mark_links(chars: &[char], skip: &mut [bool]) {
             continue;
         };
 
+        // The label may hold a pair of its own — `[ [T; N] ](url)` — so the
+        // closing bracket is the one that balances the opening one, not the
+        // first `]` on the line.
         let mut close = bracket + 1;
-        while close < chars.len() && chars[close] != ']' {
+        let mut depth = 1usize;
+        while close < chars.len() {
+            match chars[close] {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
             close += 1;
         }
         if close + 1 >= chars.len() || chars[close + 1] != '(' {
@@ -752,9 +766,13 @@ fn mark_links(chars: &[char], skip: &mut [bool]) {
             continue;
         }
 
-        // Keep the label, drop `[`, `]` and `(dest)`.
+        // Keep the label, drop `[`, `]` and `(dest)`. An image is `![alt](src)`,
+        // and the bang is furniture too: the words of it are the alt text.
         if let Some(slot) = skip.get_mut(bracket) {
             *slot = true;
+        }
+        if bracket == index + 1 {
+            skip[index] = true;
         }
         for slot in skip.iter_mut().take(end + 1).skip(close) {
             *slot = true;
@@ -954,7 +972,15 @@ fn main() {}
         assert_eq!(strip_inline_markup("**粗体** 和 *斜体*"), "粗体 和 斜体");
         assert_eq!(strip_inline_markup("~~删除~~ `code`"), "删除 code");
         assert_eq!(strip_inline_markup("[链接](https://a.b) 后文"), "链接 后文");
+        // A label that carries a bracket pair of its own is still one link.
+        assert_eq!(
+            strip_inline_markup("[ [T; N] ](https://a.b/array) 是数组"),
+            " [T; N]  是数组"
+        );
         assert_eq!(strip_inline_markup("拼音 <u>下划线</u>"), "拼音 下划线");
+        // Highlights, and an image: the alt text is what a heading says.
+        assert_eq!(strip_inline_markup("==高亮== 与 ~~删除~~"), "高亮 与 删除");
+        assert_eq!(strip_inline_markup("![架构图](a.png) 说明"), "架构图 说明");
         // Lone markers and identifiers are left alone.
         assert_eq!(strip_inline_markup("snake_case 和 3 * 4"), "snake_case 和 3 * 4");
     }

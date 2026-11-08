@@ -122,8 +122,9 @@ impl Settings {
     }
 }
 
-/// `%APPDATA%\MeowDown\settings.json` on Windows, the usual places elsewhere.
-pub fn config_path() -> PathBuf {
+/// The folder MeowDown keeps its own small files in:
+/// `%APPDATA%\MeowDown` on Windows, the usual places elsewhere.
+pub fn config_dir() -> PathBuf {
     let base = if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else if cfg!(target_os = "macos") {
@@ -133,9 +134,45 @@ pub fn config_path() -> PathBuf {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
     };
-    base.unwrap_or_else(|| PathBuf::from("."))
-        .join("MeowDown")
-        .join("settings.json")
+    base.unwrap_or_else(|| PathBuf::from(".")).join("MeowDown")
+}
+
+/// `%APPDATA%\MeowDown\settings.json` on Windows, the usual places elsewhere.
+pub fn config_path() -> PathBuf {
+    config_dir().join("settings.json")
+}
+
+/// A marker file whose existence means the bundled sample document has
+/// already had its one showing.
+///
+/// The sample is a greeting, not a landing page: it teaches the shortcuts once
+/// and then gets out of the way, because a reader who opens the program to
+/// write something does not want a file they never asked for in front of the
+/// caret. A file is used rather than a settings field so that it survives a
+/// settings file the user never touched — and so that erasing it brings the
+/// greeting back.
+fn welcome_flag(dir: &Path) -> PathBuf {
+    dir.join("welcome-shown")
+}
+
+/// True on the first launch, false on every launch after it.
+///
+/// The marker is written best-effort. A config folder that refuses the write
+/// leaves nowhere to remember the greeting, so it comes back next time — which
+/// is still better than a program that will not start because it could not
+/// write a file it only wanted for a courtesy.
+pub fn claim_welcome() -> bool {
+    claim_welcome_in(&config_dir())
+}
+
+fn claim_welcome_in(dir: &Path) -> bool {
+    let flag = welcome_flag(dir);
+    if flag.exists() {
+        return false;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(&flag, b"1");
+    true
 }
 
 impl Settings {
@@ -486,6 +523,17 @@ mod tests {
         assert_eq!(lookup(&value, "result[0]").as_deref(), Some("https://a/1.png"));
         let value: Value = serde_json::from_str(r#"{"data":{"url":"https://b/2.png"}}"#).unwrap();
         assert_eq!(lookup(&value, "data.url").as_deref(), Some("https://b/2.png"));
+    }
+
+    /// The sample document is a greeting: one launch, then never again.
+    #[test]
+    fn the_sample_is_shown_once() {
+        let dir = std::env::temp_dir().join(format!("meowdown-welcome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(claim_welcome_in(&dir), "首次启动应该显示示例");
+        assert!(!claim_welcome_in(&dir), "再次启动不再显示示例");
+        assert!(welcome_flag(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
