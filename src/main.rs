@@ -1,5 +1,11 @@
 //! MeowDown — a Typora-style WYSIWYG Markdown editor written with GPUI Kit.
 
+// A console-subsystem executable drags a black console window along with it
+// when it is started from a shortcut, from Explorer, or by the installer — a
+// document editor should arrive as one window, not two. The debug build keeps
+// the console, because that is where `println!` and `dbg!` go.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod assoc;
 mod editor;
 mod inline;

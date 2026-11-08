@@ -3,13 +3,17 @@
 # 用法（在项目根目录）：
 #   powershell -ExecutionPolicy Bypass -File .\package.ps1 -Version 0.2.0
 #
+# 只要安装包（NSIS setup.exe）：
+#   powershell -ExecutionPolicy Bypass -File .\package.ps1 -Version 0.2.0 -Setup
+#
 # 只打包当前版本（不改 Cargo.toml）：
 #   powershell -ExecutionPolicy Bypass -File .\package.ps1
 #
 # 打包并把它设为 .md 的默认应用（会写当前用户注册表）：
 #   powershell -ExecutionPolicy Bypass -File .\package.ps1 -Version 0.2.0 -Register
 #
-# 产物：dist\MeowDown-v<版本>-win64\ 和 dist\MeowDown-v<版本>-win64.zip
+# 产物：dist\MeowDown-v<版本>-win64\、dist\MeowDown-v<版本>-win64.zip，
+#       加 -Setup 时还有 dist\MeowDown-v<版本>-setup.exe
 
 param(
     # 语义化版本号，例如 0.2.0 或 0.2.0-beta.1。给了就写回 Cargo.toml，
@@ -22,6 +26,12 @@ param(
     # 打包完成后顺手把这份 exe 注册为 .md 的打开方式。
     [switch]$Register,
 
+    # 额外用 NSIS 出一个 setup.exe 安装包。
+    [switch]$Setup,
+
+    # makensis.exe 的路径。默认从 PATH 和 NSIS 的常见安装位置找。
+    [string]$Makensis = "",
+
     # 产物目录，默认 dist（已在 .gitignore 里）。
     [string]$OutDir = "dist"
 )
@@ -33,6 +43,28 @@ $root = $PSScriptRoot
 Set-Location $root
 
 function Write-Step($text) { Write-Host "==> $text" -ForegroundColor Cyan }
+
+# 找一个能用的 makensis：显式给的优先，其次是 PATH，最后是 NSIS 装完会去的
+# 几个地方（含项目自带的 tools\nsis，方便不带 NSIS 的机器直接出安装包）。
+function Find-Makensis([string]$Explicit) {
+    if ($Explicit -ne "") {
+        if (Test-Path $Explicit) { return (Resolve-Path $Explicit).Path }
+        throw "找不到 makensis：$Explicit"
+    }
+    $onPath = Get-Command makensis.exe -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+
+    $candidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"),
+        (Join-Path $env:ProgramFiles "NSIS\makensis.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\NSIS\makensis.exe"),
+        (Join-Path $root "tools\nsis\makensis.exe")
+    )
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) { return $candidate }
+    }
+    throw "没找到 makensis.exe。装一个 NSIS（winget install NSIS.NSIS），或者用 -Makensis 指定路径。"
+}
 
 # ---------------------------------------------------------------- 版本号
 
@@ -68,12 +100,14 @@ if (-not $SkipBuild) {
 $exe = Join-Path $root "target\release\meowdown.exe"
 if (-not (Test-Path $exe)) { throw "找不到 $exe，先跑一次不带 -SkipBuild 的打包" }
 
-# 确认编出来的二进制里就是刚写进去的版本号。
-$reported = (& $exe --version).Trim()
-if ($reported -ne "MeowDown $version") {
-    throw "二进制报的版本是 `"$reported`"，和 Cargo.toml 的 $version 对不上"
+# 确认编出来的二进制里就是刚写进去的版本号。release 版是 GUI 子系统
+# （windows_subsystem = "windows"），它的 stdout 抓不到，所以版本号从 PE 的
+# 版本资源里读——那是 build.rs 按 CARGO_PKG_VERSION 写进去的。
+$reported = (Get-Item $exe).VersionInfo.ProductVersion
+if ($reported -ne $version) {
+    throw "二进制里的版本是 `"$reported`"，和 Cargo.toml 的 $version 对不上（多半是没重新编译）"
 }
-Write-Step "二进制自检通过：$reported"
+Write-Step "二进制自检通过：MeowDown $reported"
 
 # ---------------------------------------------------------------- 组包
 
@@ -96,6 +130,34 @@ if (Test-Path $zip) { [System.IO.File]::Delete($zip) }
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
 Write-Step ("压缩包 {0:N1} MB" -f ((Get-Item $zip).Length / 1MB))
 
+# ---------------------------------------------------------------- 安装包
+
+$setupExe = $null
+if ($Setup) {
+    Write-Step "用 NSIS 打安装包"
+    $makensis = Find-Makensis $Makensis
+    Write-Step "makensis：$makensis"
+
+    # VIProductVersion 只认四段纯数字，0.2.0-beta.1 得先摘成 0.2.0。
+    $numeric = ($version -split '[-+]')[0]
+    $parts = @($numeric -split '\.')
+    while ($parts.Count -lt 4) { $parts += "0" }
+    $quad = ($parts[0..3] -join '.')
+
+    $setupExe = Join-Path $root (Join-Path $OutDir "MeowDown-v$version-setup.exe")
+    if (Test-Path $setupExe) { [System.IO.File]::Delete($setupExe) }
+
+    & $makensis /V2 `
+        "/DVERSION=$version" `
+        "/DVERSION_QUAD=$quad" `
+        "/DOUTFILE=$setupExe" `
+        "/DSRCDIR=$root" `
+        (Join-Path $root "installer.nsi")
+    if ($LASTEXITCODE -ne 0) { throw "makensis 编译失败（退出码 $LASTEXITCODE）" }
+
+    Write-Step ("安装包 {0:N1} MB" -f ((Get-Item $setupExe).Length / 1MB))
+}
+
 # ---------------------------------------------------------------- 关联
 
 if ($Register) {
@@ -107,6 +169,7 @@ Write-Host ""
 Write-Host "完成：" -ForegroundColor Green
 Write-Host "  目录  $stage"
 Write-Host "  压缩包 $zip"
+if ($setupExe) { Write-Host "  安装包 $setupExe" }
 if ($Register) {
     Write-Host ""
     Write-Host "提示：Windows 10/11 的默认程序由「设置 → 应用 → 默认应用」里的 UserChoice 决定，" -ForegroundColor Yellow

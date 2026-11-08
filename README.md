@@ -43,6 +43,19 @@ dist\MeowDown-v0.2.0-win64\
 dist\MeowDown-v0.2.0-win64.zip
 ```
 
+要安装包（NSIS 的 setup.exe）就加 `-Setup`：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\package.ps1 -Version 0.2.0 -Setup
+```
+
+产物多一个 `dist\MeowDown-v0.2.0-setup.exe`（约 8 MB）。它装到当前用户的
+`%LOCALAPPDATA%\Programs\MeowDown`，不写 `HKLM`、不弹 UAC；向导里可以选桌面
+快捷方式、开始菜单和 `.md` 关联，卸载入口在「设置 → 应用 → 已安装的应用」。
+
+`-Setup` 需要 `makensis`：`winget install NSIS.NSIS` 即可，装在别处就用
+`-Makensis <路径>` 指定。安装脚本是 `installer.nsi`，也可以自己手动编译。
+
 只想用当前版本号打包：去掉 `-Version`。加上 `-Register` 会顺手把这份 exe 注册为 `.md` 的打开方式。
 
 ## 设为 .md 默认应用

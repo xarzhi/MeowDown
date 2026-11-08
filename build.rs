@@ -1,10 +1,16 @@
-//! Embeds `assets/app.ico` into the executable as icon resource #1.
+//! Embeds `assets/app.ico` into the executable as icon resource #1, and stamps
+//! the crate version into the PE version resource.
 //!
 //! gpui's Windows backend gives a window its icon by calling
 //! `LoadImageW(module, MAKEINTRESOURCE(1), IMAGE_ICON, ..)` on the module
 //! itself, so the icon has to live in the PE resources — `WindowOptions.icon`
 //! is not consulted on Windows. The same resource is what Explorer and the
 //! taskbar show for the executable.
+//!
+//! The version block is there so `package.ps1` can read the version off the
+//! file instead of running it: the release build is a GUI-subsystem program
+//! (`windows_subsystem = "windows"`), and its stdout is not something a
+//! PowerShell one-liner can reliably capture.
 //!
 //! `rc.exe` comes from the Windows SDK. We look it up by path instead of going
 //! through `embed-resource`/`winres`, because both of those probe the registry
@@ -22,6 +28,7 @@ const PREFERRED: [&str; 2] = ["10.0.22621.0", "10.0.26100.0"];
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/app.ico");
+    println!("cargo:rerun-if-changed=Cargo.toml");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -45,16 +52,47 @@ fn main() {
         return;
     };
 
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    let [a, b, c, d] = version_quad(&version);
+
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let script = out.join("icon.rc");
+    let script = out.join("meowdown.rc");
     // rc.exe wants backslashes escaped inside a quoted string.
     let escaped = icon.display().to_string().replace('\\', "\\\\");
-    if let Err(err) = fs::write(&script, format!("1 ICON \"{escaped}\"\n")) {
-        println!("cargo:warning=could not write icon.rc: {err}");
+    let contents = format!(
+        "1 ICON \"{escaped}\"\n\
+         \n\
+         1 VERSIONINFO\n\
+         FILEVERSION {a},{b},{c},{d}\n\
+         PRODUCTVERSION {a},{b},{c},{d}\n\
+         FILEOS 0x40004L\n\
+         FILETYPE 0x1L\n\
+         BEGIN\n\
+         BLOCK \"StringFileInfo\"\n\
+         BEGIN\n\
+         BLOCK \"080404b0\"\n\
+         BEGIN\n\
+         VALUE \"CompanyName\", \"xarzhi\"\n\
+         VALUE \"FileDescription\", \"MeowDown\"\n\
+         VALUE \"FileVersion\", \"{version}\"\n\
+         VALUE \"InternalName\", \"MeowDown\"\n\
+         VALUE \"OriginalFilename\", \"MeowDown.exe\"\n\
+         VALUE \"ProductName\", \"MeowDown\"\n\
+         VALUE \"ProductVersion\", \"{version}\"\n\
+         END\n\
+         END\n\
+         BLOCK \"VarFileInfo\"\n\
+         BEGIN\n\
+         VALUE \"Translation\", 0x804, 1200\n\
+         END\n\
+         END\n"
+    );
+    if let Err(err) = fs::write(&script, contents) {
+        println!("cargo:warning=could not write meowdown.rc: {err}");
         return;
     }
 
-    let res = out.join("icon.res");
+    let res = out.join("meowdown.res");
     match Command::new(&rc).arg("/nologo").arg("/fo").arg(&res).arg(&script).output() {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
@@ -77,6 +115,20 @@ fn main() {
         return;
     }
     println!("cargo:rustc-link-arg-bins={res}");
+}
+
+/// `0.2.0` and `0.2.0-beta.1` both become `0,2,0,0`: `FILEVERSION` takes four
+/// plain numbers and would otherwise reject the resource.
+fn version_quad(version: &str) -> [u16; 4] {
+    let numeric = version
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("0");
+    let mut parts = [0u16; 4];
+    for (slot, piece) in parts.iter_mut().zip(numeric.split('.')) {
+        *slot = piece.parse().unwrap_or(0);
+    }
+    parts
 }
 
 fn find_rc() -> Option<PathBuf> {
